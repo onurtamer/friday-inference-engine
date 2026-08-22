@@ -1,0 +1,10 @@
+*.bin
+*.safetensors
+*.exe
+*.obj
+*.lib
+*.exp
+__pycache__/
+.cache/
+expert_map.json
+tokenizer_config.json
