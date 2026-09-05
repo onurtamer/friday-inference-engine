@@ -1,0 +1,11 @@
+{
+  "vocab_size": 304133,
+  "hidden_dim": 5120,
+  "num_heads": 40,
+  "num_kv_heads": 8,
+  "num_layers": 48,
+  "rms_norm_epsilon": 9.999999974752427e-07,
+  "quant_type": "Q4_0",
+  "max_position_embeddings": 32768,
+  "rope_freq_base": 1000000.0
+}

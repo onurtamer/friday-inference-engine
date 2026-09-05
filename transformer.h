@@ -1,13 +1,15 @@
 #ifndef FRIDAY_TRANSFORMER_H
 #define FRIDAY_TRANSFORMER_H
 
-#include <cuda_fp16.h> // For half type
-#include <cuda_runtime.h> // For cudaStream_t, device pointers
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <map>
-#include <tuple>
-#include <vector> // For std::vector in expert_file_map, though map is specified.
+#include <vector>
+#include <string> // std::string için
+#include <nlohmann/json.hpp> // JSON ayrıştırma için
 
-// Define CUDA_CHECK macro for error checking
+// CUDA_CHECK makrosu
+#ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                \
     do {                                                \
         cudaError_t err = call;                         \
@@ -17,115 +19,160 @@
             exit(EXIT_FAILURE);                         \
         }                                               \
     } while (0)
+#endif
 
-// --- Asynchronous I/O Manager Stub ---
-// In a real system, this would be a full-fledged class managing device memory,
-// host staging buffers, and asynchronous transfers.
-class AsyncIOManager {
-public:
-    AsyncIOManager() = default;
-    ~AsyncIOManager() = default;
+// Tensor bilgilerini tutacak yapı
+struct TensorInfo {
+    std::string name;
+    size_t absolute_offset;
+    size_t size_bytes;
+    std::vector<long long> shape;
+    std::string dtype; // GGUF Dtype, örn: Q4_0, F16
 
-    // A placeholder to simulate an async read request for expert weights from SSD.
-    // In a real scenario, this would likely take a destination device pointer,
-    // and return a future/event to track completion.
-    // For now, it just prints a message.
-    void enqueueReadExpertWeights(
-        int expert_id,
-        size_t file_offset,
-        size_t size_bytes,
-        unsigned char* d_destination_ptr, // Device memory where packed weights will be read into
-        cudaStream_t stream) {
-        // Simulate enqueueing an I/O request
-        printf("AsyncIOManager: Enqueueing read for expert %d. Offset: %zu, Size: %zu bytes. Destination address: %p\n",
-               expert_id, file_offset, size_bytes, d_destination_ptr);
-        // In a real implementation, this would involve:
-        // 1. Allocating host staging buffer (if not pre-allocated)
-        // 2. Issuing async read from SSD to host buffer
-        // 3. Issuing async cudaMemcpyAsync from host buffer to d_destination_ptr
-        // 4. Recording an event to track completion.
-    }
+    TensorInfo() : name(""), absolute_offset(0), size_bytes(0), shape({}), dtype("") {}
+};
+
+// AsyncIOManager sınıfının forward deklarasyonu
+class AsyncIOManager; 
+enum QuantType; // kernel_dispatcher.h'den
+
+// Katman yapısını ve tensör bağıl ofsetlerini tutan yapı (Zero cudaMalloc mimarisi)
+struct LayerInfo {
+    size_t start_offset = 0;
+    size_t size_bytes = 0;
+    std::map<std::string, size_t> tensor_rel_offsets;
 };
 
 class Transformer {
 public:
-    // Constructor takes device pointers to model weights and dimensions.
-    // Ownership of pointers is assumed to be external for simplicity,
-    // or handled by an `init` method.
     Transformer(
-        int hidden_dim,
-        int num_heads,
-        int num_experts,
-        int top_k_experts,
-        float rms_norm_epsilon,
-        // QKV projection weights (FP16)
-        const half* d_Wq, const half* d_Wk, const half* d_Wv,
-        // MoE Router weights (FP16)
-        const half* d_router_weights,
-        // Pointer to AsyncIOManager
-        AsyncIOManager* async_io_manager_ptr
+        const std::string& model_file_path,
+        const std::string& tensor_map_path,
+        int model_hidden_dim,
+        int model_num_heads,
+        int model_num_kv_heads,
+        int model_num_layers,
+        float model_rms_norm_epsilon,
+        QuantType model_quant_type,
+        AsyncIOManager* async_io_manager_ptr,
+        double vram_limit_gb = 0.0
     );
 
-    // RMSNorm: input -> output
-    void applyRMSNorm(
-        half* d_input,
-        const half* d_weight, // LayerNorm weight (gamma)
-        half* d_output,
-        int size,
+    ~Transformer();
+
+    // RMSNorm (weights are float32 in GGUF)
+    void applyRMSNorm(half* d_input, const float* d_weight, half* d_output, int size, cudaStream_t stream);
+
+    // RoPE
+    void applyRoPE(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, cudaStream_t stream);
+
+    // Self-Attention (Double Buffering d_layer_buf üzerinden)
+    void applySelfAttention(
+        int layer_idx,
+        unsigned char* d_layer_buf,
+        half* d_input_activations,
+        half* d_query_out,
+        half* d_key_out,
+        half* d_value_out,
+        half* d_attention_output,
+        int seq_len,
+        int pos_offset,
         cudaStream_t stream);
 
-    // RoPE: Applies rotary positional embeddings to Q and K vectors
+    // MoE Router veya Dense MLP katmanı (Double Buffering d_layer_buf üzerinden)
+    void forwardMLPLayer(
+        int layer_idx,
+        unsigned char* d_layer_buf,
+        half* d_input_activations,
+        half* d_output_activations,
+        cudaStream_t stream
+    );
+
+    // GeLU Aktivasyonu
     void applyGeLU(half* d_activations, int size, cudaStream_t stream);
 
-    void applyRoPE(
-        half* d_query,
-        half* d_key,
-        int head_dim,
+    // Ana Forward Pass: Ping-Pong Double Buffering mimarisi ile
+    void forward(
+        half* d_input_activations,
+        half* d_output_logits,
         int seq_len,
-        int pos_offset,
-        cudaStream_t stream);
+        int layer_offset = 0,
+        int pos_offset = 0,
+        cudaStream_t stream = nullptr
+    );
 
-    // Self-Attention: Performs QKV projections and subsequent attention logic
-    void applySelfAttention(
-        half* d_input_activations, // input to QKV projections (1 x hidden_dim_)
-        half* d_query_out,         // device buffer for Q (1 x hidden_dim_)
-        half* d_key_out,           // device buffer for K (1 x hidden_dim_)
-        half* d_value_out,         // device buffer for V (1 x hidden_dim_)
-        // Output attention context vector, typically after softmax(QK^T)V
-        half* d_attention_output,  // (1 x hidden_dim_)
-        int seq_len,
-        int pos_offset,
-        cudaStream_t stream);
+    // Token ID'den embedding vektörünü alır
+    bool getEmbedding(int token_id, half* d_embedding, int vocab_size, cudaStream_t stream);
 
-    // MoE Router: Computes router logits, selects top-K experts, and triggers async I/O.
-    void routeMixtureOfExperts(
-        half* d_input_activations, // Input to the MoE router (FP16, 1 x hidden_dim_)
-        // Buffers for storing selected expert data (e.g., intermediate activations)
-        half* d_expert_input_buffer,   // (1 x expert_hidden_dim_)
-        half* d_expert_output_buffer,  // (1 x expert_hidden_dim_)
-        // For the purpose of this stub, we'll assume the loaded expert weights
-        // will be put into d_expert_weights_buffer_ptr. This needs to be unsigned char* for packed weights.
-        unsigned char* d_expert_weights_buffer_ptr, // Placeholder for where async-loaded *packed* weights go
-        // Expert map (host-side) needed to get file offsets
-        const std::map<int, std::tuple<size_t, size_t, std::vector<int>>>& expert_file_map, // expert_id -> (offset, size, original_shape)
-        cudaStream_t stream);
+    int getHiddenDim() const { return hidden_dim_; }
+    int getVocabSize() const {
+        auto it = full_tensor_map_.find("output.weight");
+        if (it != full_tensor_map_.end() && it->second.shape.size() == 2) {
+            return (int)it->second.shape[1];
+        }
+        return 0;
+    }
 
+    std::map<std::string, TensorInfo> full_tensor_map_;
 
 private:
+    std::string model_file_path_;
     int hidden_dim_;
     int num_heads_;
-    int head_dim_; // hidden_dim / num_heads
-    int num_experts_;
-    int top_k_experts_;
+    int num_kv_heads_;
+    int head_dim_;
+    int num_layers_;
     float rms_norm_epsilon_;
+    QuantType model_quant_type_;
 
-    // Device pointers to model weights (owned externally or managed via init/destroy)
-    const half* d_Wq_;
-    const half* d_Wk_;
-    const half* d_Wv_;
-    const half* d_router_weights_; // FP16 weights for router
+    AsyncIOManager* async_io_manager_ptr_;
 
-    AsyncIOManager* async_io_manager_ptr_; // Pointer to the async I/O manager
+    // KV-Cache storage (Host tarafında)
+    std::vector<std::vector<std::vector<half>>> k_cache_;
+    std::vector<std::vector<std::vector<half>>> v_cache_;
+
+    // ============================================================
+    // V32: Esnek Hibrit Bellek (Elastic Tiered Memory)
+    // ============================================================
+    double vram_limit_gb_ = 0.0;
+    int num_gpu_resident_layers_ = 0;
+    std::vector<unsigned char*> d_gpu_resident_layers_;
+    std::vector<unsigned char*> h_offload_pinned_cache_;
+
+    // Sadece akitilan (stream edilen) katmanlar icin Ping-Pong tamponlari
+    unsigned char* d_layer_buffer_A_ = nullptr;
+    unsigned char* d_layer_buffer_B_ = nullptr;
+
+    // Gerçek asenkron DMA transferleri için Pinned Host Buffer'lar
+    unsigned char* h_pinned_buffer_A_ = nullptr;
+    unsigned char* h_pinned_buffer_B_ = nullptr;
+
+    size_t layer_buffer_size_ = 0;
+    std::vector<LayerInfo> layers_info_;
+
+    // Ping-Pong Asenkron Akışları
+    cudaStream_t stream_compute_ = nullptr; // Stream 1: GPU Hesaplama
+    cudaStream_t stream_io_ = nullptr;      // Stream 2: NVMe/PCIe Prefetch
+
+    // KV Cache VRAM Rezerv Havuzu (4-5 GB VRAM Kilidi)
+    void* d_kv_cache_pool_ = nullptr;
+    size_t kv_pool_size_bytes_ = 0;
+
+    // Katman dışı statik tensörler (Emb & LM Head)
+    unsigned char* d_token_embd_ = nullptr;
+    unsigned char* d_output_norm_ = nullptr;
+    unsigned char* d_lm_head_ = nullptr;
+
+    // Temporary buffers for forward pass to avoid cudaMalloc/cudaFree per token
+    half *d_query_out_ = nullptr, *d_key_out_ = nullptr, *d_value_out_ = nullptr;
+    half *d_attention_output_ = nullptr, *d_mlp_output_ = nullptr, *d_norm_output_ = nullptr;
+    half *d_gate_out_ = nullptr, *d_up_out_ = nullptr;
+    int max_intermediate_size_ = 0;
+
+    void loadTensorMap(const std::string& map_path);
+    QuantType getQuantTypeFromDtype(const std::string& dtype_str);
 };
 
 #endif // FRIDAY_TRANSFORMER_H
+
+

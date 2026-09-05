@@ -1,49 +1,56 @@
-#ifndef FRIDAY_IO_MANAGER_H
-#define FRIDAY_IO_MANAGER_H
+#ifndef FRIDAY_ASYNC_IO_MANAGER_H
+#define FRIDAY_ASYNC_IO_MANAGER_H
 
-#include "friday_types.h"
-#include <functional>
-#include <string>
-#include <memory> // For std::unique_ptr
-#include <future> // For std::future
-#include <mutex>  // _callback_mutex için
-#include <unordered_map> // _callbacks için
-#include <list> // _pending_requests için (Windows'ta listeye gerek kalmayabilir, I/O completion portları daha farklı)
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <string> // C++ string için
 
-// I/OManager sınıfı, asenkron ve O_DIRECT/FILE_FLAG_NO_BUFFERING özellikli disk okumalarını yönetir.
-class IOManager {
+// CUDA_CHECK makrosu (tekrar tanımlanmaması için burada da tanımlıyoruz veya ayrı bir utility header'dan alıyoruz)
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                \
+    do {                                                \
+        cudaError_t err = call;                         \
+        if (err != cudaSuccess) {                       \
+            fprintf(stderr, "CUDA error at %s:%d: %s: %s\n",\
+                    __FILE__, __LINE__, cudaGetErrorString(err), #call); \
+            exit(EXIT_FAILURE);                         \
+        }                                               \
+    } while (0)
+#endif
+
+// AsyncIOManager sınıfı
+class AsyncIOManager {
 public:
-    IOManager();
-    ~IOManager();
+    // C++'ta Zero-Copy I/O için dosya handle'ı ve eşleşen parametreler tutulabilir.
+    // Windows için HANDLE, Linux için int fd.
+    // Bu örnekte, temel simülasyon ve hizalama mantığına odaklanacağız.
+    // Gerçek implementasyon platforma özgü API'ler kullanır (e.g., CreateFile/ReadFile for Windows, open/pread for Linux).
 
-    bool open_model_file(const std::string& filepath);
-    void close_model_file();
+    AsyncIOManager(const std::string& model_file_path); // Constructor dosya yolunu alsın
+    ~AsyncIOManager();
 
-    std::unique_ptr<AsyncIORequest> async_read_ssd_block(
-        void* buffer,
-        size_t size,
-        off_t offset,
-        std::function<void(AsyncIOStatus, std::unique_ptr<AsyncIORequest>)> callback
-    );
+    // Zero-Copy okuma yapabilmek için SSD'nin sektör boyutunu sabit olarak alalım
+    static const size_t SECTOR_SIZE = 4096; // 4KB
 
-    void poll_io_events();
+    // Asenkron okuma isteğini kuyruğa ekler.
+    // Okuma boyutu (size_bytes) otomatik olarak SECTOR_SIZE'ın katlarına yuvarlanır.
+    void enqueueReadExpertWeights(
+        int expert_id,
+        size_t file_absolute_offset,      // Dosya içindeki mutlak başlangıç ofseti
+        size_t requested_size_bytes,      // İstenen okuma boyutu
+        unsigned char* d_destination_ptr, // Paketlenmiş ağırlıkların yazılacağı cihaz belleği işaretçisi
+        cudaStream_t stream = nullptr);
+
+    // NVMe diskten pinned host buffer içine doğrudan katman okuma
+    bool readLayerToHost(
+        size_t file_absolute_offset,
+        size_t size_bytes,
+        unsigned char* h_destination_ptr);
 
 private:
-    #ifdef _WIN32
-    HANDLE _file_handle;
-    static VOID CALLBACK FileIOCompletionRoutine(
-        DWORD dwErrorCode,
-        DWORD dwNumberOfBytesTransfered,
-        LPOVERLAPPED lpOverlapped
-    );
-    std::unordered_map<OVERLAPPED*, std::function<void(AsyncIOStatus, std::unique_ptr<AsyncIORequest>)>> _callbacks_win;
-    std::mutex _callback_mutex_win;
-    #else // Linux
-    int _file_descriptor;
-    std::list<std::unique_ptr<AsyncIORequest>> _pending_requests;
-    std::unordered_map<AsyncIORequest*, std::function<void(AsyncIOStatus, std::unique_ptr<AsyncIORequest>)>> _callbacks;
-    std::mutex _callback_mutex;
-    #endif
+    std::string model_file_path_; // Açılacak model dosyasının yolu
+    FILE* file_handle_ = nullptr; // Kalıcı dosya handle'ı (her katmanda dosya açma-kapama iptal)
 };
 
-#endif // FRIDAY_IO_MANAGER_H
+#endif // FRIDAY_ASYNC_IO_MANAGER_H

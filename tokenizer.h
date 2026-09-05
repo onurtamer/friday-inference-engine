@@ -23,6 +23,20 @@ private:
     std::map<int, std::string> id_to_token_;     // Maps token IDs to their string representations.
     std::map<std::string, int> token_to_id_;     // Maps string tokens to their integer IDs.
     int unk_token_id_ = -1;                     // ID for unknown tokens.
+    int eos_token_id_ = -1;                     // ID for end-of-sequence token.
+
+public:
+    // Public getters for tokenizer info
+    int getVocabSize() const { return id_to_token_.size(); }
+    int getUnkTokenId() const { return unk_token_id_; }
+    int getEosTokenId() const { return eos_token_id_; }
+
+    // Qwen special token IDs
+    static constexpr int IM_START_ID = 151644;
+    static constexpr int IM_END_ID   = 151645;
+
+    // Applies Qwen ChatML template around the user's raw prompt
+    std::string applyChatTemplate(const std::string& prompt) const;
 
     // Helper function to parse a simple JSON-like configuration file.
     // This is a minimal parser, not robust for complex JSON.
@@ -33,3 +47,4 @@ private:
 };
 
 #endif // FRIDAY_TOKENIZER_H
+

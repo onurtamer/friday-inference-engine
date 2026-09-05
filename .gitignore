@@ -1,10 +1,65 @@
+# Large model binaries and weights
 *.bin
+*.gguf
 *.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Windows executable and build artifacts
 *.exe
 *.obj
 *.lib
 *.exp
+*.pdb
+*.ilk
+*.idb
+build/
+bin/
+out/
+x64/
+x86/
+Debug/
+Release/
+
+# Visual Studio and IDE caches
+.vs/
+.vscode/
+.idea/
+
+# Python caches and artifacts
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 .cache/
-expert_map.json
+
+# Experimental scratch / temporary scripts
+test_sizes.cu
+recovered_*
+extract_*
+patch*
+find_*
+fix_*
+force_dl.py
+gguf_architect.py
+gguf_mapper.py
+sector_aligner.py
+setup_friday2.py
+test_ddg.py
+test_flight.py
+update_*.py
+recover.py
+convert_to_friday.py
+friday_server.py
+friday_cli.py
+friday_engine.*
+friday_poc_windows.*
+sdem_reader.h
+friday_types.h
+*.log
+upload_to_github.ps1
 tokenizer_config.json
+expert_map.json
+transformer_recovered.cpp
+*.bat
