@@ -62,3 +62,7 @@ tokenizer_config.json
 expert_map.json
 transformer_recovered.cpp
 *.bat
+
+# Generated per model by converter.py
+tensor_map.json
+model_params.json
