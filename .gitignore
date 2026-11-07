@@ -66,3 +66,6 @@ transformer_recovered.cpp
 # Generated per model by converter.py
 tensor_map.json
 model_params.json
+
+# Local archive of old scripts, logs and binaries (see attic/MANIFEST.txt)
+attic/
