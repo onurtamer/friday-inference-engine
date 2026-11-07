@@ -38,6 +38,11 @@ static QuantType quantFromString(const std::string& s) {
     return UNKNOWN;
 }
 
+// Optional reference-runtime check: log-probability this engine assigns, at each
+// generated step, to the reference runtime's top-1 token.
+static const std::vector<int>* g_ref_top1 = nullptr;
+static std::vector<double> g_top1_logprob;
+
 // Same selection rule as main.cpp: skip NaN/Inf, first maximum wins.
 static int argmaxLogits(const half* d_logits, int vocab, cudaStream_t s, int* nan_count) {
     std::vector<half> h(vocab);
@@ -50,6 +55,16 @@ static int argmaxLogits(const half* d_logits, int vocab, cudaStream_t s, int* na
         if (v > best_v) { best_v = v; best = i; }
     }
     *nan_count = nans;
+    const size_t step = g_top1_logprob.size();
+    if (g_ref_top1 && step < g_ref_top1->size() && best >= 0) {
+        double z = 0;
+        for (int i = 0; i < vocab; ++i) {
+            float v = __half2float(h[i]);
+            if (std::isfinite(v)) z += std::exp((double)v - best_v);
+        }
+        const float x = __half2float(h[(*g_ref_top1)[step]]);
+        g_top1_logprob.push_back(std::isfinite(x) ? (double)x - best_v - std::log(z) : -1e30);
+    }
     return best;
 }
 
@@ -102,6 +117,23 @@ int main(int argc, char** argv) {
         const size_t prompt_len = tokens.size();
         int nans = 0, total_nans = 0;
 
+        // Reference runtime (optional): <golden_dir>/llama_cpp_reference.json
+        nlohmann::json ref;
+        std::vector<int> ref_tokens, ref_top1;
+        std::vector<double> ref_top1_lp;
+        {
+            std::ifstream rf(golden_dir + "/llama_cpp_reference.json");
+            if (rf.is_open()) {
+                ref = nlohmann::json::parse(rf);
+                ref_tokens = ref.at("tokens").get<std::vector<int>>();
+                for (const auto& st : ref.at("steps")) {
+                    ref_top1.push_back(st.at("top")[0][0].get<int>());
+                    ref_top1_lp.push_back(st.at("top")[0][1].get<double>());
+                }
+                g_ref_top1 = &ref_top1;
+            }
+        }
+
         auto step = [&](int tok, int pos) {
             if (!transformer.getEmbedding(tok, d_act, vocab, s))
                 throw std::runtime_error("embedding failed for token " + std::to_string(tok));
@@ -147,10 +179,30 @@ int main(int argc, char** argv) {
                pre_s, prompt_len / pre_s, dec_s, (out.size() > 1 ? (out.size() - 1) / dec_s : 0.0));
         printf("[GOLDEN] generated ids:");
         for (int t : out) printf(" %d", t);
-        printf("\n[GOLDEN] RESULT: %s\n", mismatches == 0 ? "PASS" : "FAIL");
+        printf("\n");
+
+        // Reference-runtime checks: identical greedy tokens, and top-1 log-prob within tolerance.
+        bool ref_ok = true;
+        if (!ref_tokens.empty()) {
+            const double kTop1LogprobTol = 0.3;
+            int ref_mismatch = 0;
+            for (size_t i = 0; i < ref_tokens.size(); ++i)
+                if (i >= out.size() || out[i] != ref_tokens[i]) ++ref_mismatch;
+            double max_d = 0; size_t worst = 0;
+            for (size_t i = 0; i < g_top1_logprob.size() && i < ref_top1_lp.size(); ++i) {
+                const double d = std::fabs(g_top1_logprob[i] - ref_top1_lp[i]);
+                if (d > max_d) { max_d = d; worst = i; }
+            }
+            ref_ok = ref_mismatch == 0 && g_top1_logprob.size() == ref_top1_lp.size() && max_d < kTop1LogprobTol;
+            printf("[REFERENCE] %s: token mismatches %d/%zu | max |top-1 logprob diff| %.4f at step %zu (tol %.2f) | %s\n",
+                   ref.value("runtime", std::string("reference")).c_str(), ref_mismatch, ref_tokens.size(),
+                   max_d, worst, kTop1LogprobTol, ref_ok ? "PASS" : "FAIL");
+        }
+        const bool pass = mismatches == 0 && ref_ok;
+        printf("[GOLDEN] RESULT: %s\n", pass ? "PASS" : "FAIL");
 
         cudaFree(d_logits); cudaFree(d_act); cudaStreamDestroy(s);
-        return mismatches == 0 ? 0 : 1;
+        return pass ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "[GOLDEN] ERROR: " << e.what() << "\n";
         return 3;

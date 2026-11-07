@@ -20,6 +20,21 @@ recorded, docs updated, commit reviewed.
 - **Order:** R0 → R1 → R4 (CUDA) → R5 → R2 → R3 → R6 → R7 → R8.
   ARM-side optimizations follow with the backend HAL in R3.
 
+## Progress
+
+- **R0 — done (2026-11-07).** Clean clone builds; CTest suite (unit/gpu/model).
+- **R1 — in progress.**
+  - [x] BPE tokenizer matches the reference Qwen2 tokenizer (20/20 ids).
+  - [x] Kernel tests vs. gguf reference dequantization (Q2_K/Q3_K/Q4_K/Q6_K, Q2_K embedding).
+  - [x] Logits vs. a reference runtime: llama.cpp b12189, Qwen2.5-32B Q2_K, 32/32
+        greedy tokens identical, top-1 log-prob diff median 0.002 / max 0.28.
+  - [ ] Embeddings for the remaining K-quant types; kernel launch error checks.
+  - [ ] ASAN + compute-sanitizer clean; build warnings (C4297, LNK4098).
+- **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
+  FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
+  llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).
+  Goal: exceed llama.cpp on the same hardware and model.
+
 ## v1.0 — public local inference engine
 
 | ID | Milestone | Exit gate |
