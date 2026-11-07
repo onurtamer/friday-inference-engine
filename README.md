@@ -8,11 +8,12 @@
 [![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900.svg?style=for-the-badge&logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20Native-0078D6.svg?style=for-the-badge&logo=windows)](https://microsoft.com)
 [![Model](https://img.shields.io/badge/Model-Qwen2.5--14B-8A2BE2.svg?style=for-the-badge)](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct)
-[![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20External-success.svg?style=for-the-badge)](#-design-philosophy)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-Experimental-orange.svg?style=for-the-badge)](docs/ROADMAP.md)
 
 <p align="center">
-  <b>Run 14-Billion Parameter LLMs locally on consumer GPUs with as little as 4 GB – 6 GB VRAM.</b><br>
-  No PyTorch. No ONNX Runtime. No llama.cpp. No vLLM. Just pure bare-metal C++ and CUDA.
+  <b>Run 14-billion-parameter LLMs locally on a consumer GPU within a 6 GB VRAM budget.</b><br>
+  No PyTorch. No ONNX Runtime. No llama.cpp. No vLLM. Plain C++17 and CUDA (plus the header-only nlohmann/json).
 </p>
 
 </div>
@@ -21,7 +22,9 @@
 
 ## 📖 Overview
 
-**FRIDAY Engine 2.0** is an experimental, bare-metal high-performance inference engine written from scratch in **C++17** and **NVIDIA CUDA**. 
+**FRIDAY Engine 2.0** is an experimental inference engine written from scratch in **C++17** and **NVIDIA CUDA**.
+
+> **Project status:** experimental. The v1 plan (CUDA + ARM64 CPU backends, GGUF loading, chat, persistent memory, OpenAI-compatible API) is in [docs/ROADMAP.md](docs/ROADMAP.md); decisions are recorded in [docs/decisions/](docs/decisions/).
 
 Modern cloud and edge LLM deployments are heavily constrained by high memory demands and runtime overhead. Running a **14-Billion parameter** model (like `Qwen2.5-14B-Instruct`) typically requires 10 GB – 16 GB of dedicated GPU VRAM. 
 
@@ -54,7 +57,7 @@ flowchart TD
 
     subgraph Kernels["4. Native CUDA Kernels & Output"]
         COMPUTE --> RMS["RMSNorm Kernel (Warp Shuffle)"]
-        RMS --> ATTN["GQA Attention + Custom RoPE (Base 1M)"]
+        RMS --> ATTN["Custom RoPE (Base 1M) on GPU; GQA attention on CPU"]
         ATTN --> SOFTMAX["FP32-Safe Softmax (Overflow-Proof)"]
         SOFTMAX --> MLP["SwiGLU Activation + Down Projection"]
         MLP --> STREAM["BPE UTF-8 Tokenizer -> Console Stream"]
@@ -78,6 +81,8 @@ FRIDAY does not link against external BLAS or inference libraries. Every operati
 - **SwiGLU Non-Linearity:** Parallel fused kernel computing `silu(gate) * up` in place.
 
 ### 3. 🛡️ Numerically Stable FP32-Safe Softmax
+> In the current version, self-attention and its softmax run on the **CPU** (Q/K/V are copied to host memory and the KV cache lives in host RAM). Moving attention and the KV cache to the GPU is planned (roadmap R4).
+
 Under Grouped-Query Attention (GQA) with scaling factors ($1 / \sqrt{d_k}$), standard FP16 softmax accumulators often experience exponent overflow or catastrophic cancellation, producing `NaN` or infinite values.
 FRIDAY Engine implements a **two-pass online Safe Softmax**:
 1. Finds the maximum attention score per head across sequence positions.
@@ -90,7 +95,7 @@ FRIDAY Engine implements a **two-pass online Safe Softmax**:
 - **Real-Time Token Streaming:** Tokens appear immediately on the console (`std::flush`) with negligible latency as they are decoded.
 
 ### 5. 📦 4KB Sector-Aligned Weight Serialization (`converter.py`)
-Standard GGUF files place tensor payloads at variable byte alignments. FRIDAY includes a standalone Python utility (`converter.py`) that reads standard GGUF models and serializes them into **4096-byte sector-aligned binary files (`friday_aligned_int4.bin`)**, enabling unbuffered asynchronous DMA (`O_DIRECT`) compatible with modern NVMe storage controllers.
+Standard GGUF files place tensor payloads at variable byte alignments. FRIDAY includes a standalone Python utility (`converter.py`) that reads standard GGUF models and serializes them into **4096-byte sector-aligned binary files (`friday_aligned_int4.bin`)**. The alignment is a prerequisite for unbuffered I/O (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`); the current loader still uses buffered `fread`, and unbuffered I/O is planned (roadmap R4).
 
 ---
 
@@ -113,13 +118,18 @@ friday-inference-engine/
 ├── int4_kernel.cu              # Dedicated INT4 GEMV & RMSNorm kernels
 ├── tokenizer.h                 # BPE Tokenizer interface
 ├── tokenizer.cpp               # BPE encoding, ChatML parser, and UTF-8 mapper
+├── friday_types.h              # Platform I/O types and alignment constants
 ├── converter.py                # Standalone GGUF -> 4KB Aligned BIN converter
 ├── model_params.json           # Model configuration parameters (dim, heads, layers)
 ├── tensor_map.json             # Offset and dimension lookup table for weights
 ├── include/
 │   └── nlohmann/
 │       └── json.hpp            # Header-only JSON library for parameter mapping
+├── docs/
+│   ├── ROADMAP.md              # Milestones and version scope
+│   └── decisions/              # Architecture decision records (ADRs)
 ├── .gitignore                  # Strict ignore rules for large weights and build artifacts
+├── LICENSE                     # Apache License 2.0
 └── README.md                   # Technical documentation
 ```
 
@@ -128,11 +138,11 @@ friday-inference-engine/
 ## 🚀 Quick Start Guide
 
 ### Prerequisites
-- **Operating System:** Windows 10 / 11 (or Linux with CUDA support)
+- **Operating System:** Windows 10 / 11 (Linux builds are not yet tested)
 - **Compiler:** Microsoft Visual Studio 2022 (MSVC C++17)
 - **CUDA Toolkit:** NVIDIA CUDA Toolkit 12.0 or higher
 - **Build System:** CMake 3.18 or higher
-- **GPU:** NVIDIA GPU with Compute Capability 7.5+ (RTX 2000, 3000, 4000 series, or datacenter GPUs)
+- **GPU:** NVIDIA GPU. The build targets `sm_86` (RTX 30-series) by default; other architectures need `CMAKE_CUDA_ARCHITECTURES` changed and are untested.
 
 ### Step 1: Clone the Repository
 ```bash
@@ -161,7 +171,7 @@ Launch the engine with your preferred VRAM allocation:
 # Auto-detect available VRAM:
 .\build\Release\FridayEngine.exe
 
-# Or specify an exact VRAM ceiling (e.g., 6.0 GB for a 6GB RTX GPU):
+# Or cap the VRAM budget (e.g., 6.0 GB):
 .\build\Release\FridayEngine.exe --vram 6.0 friday_aligned_int4.bin
 ```
 
@@ -178,9 +188,9 @@ Launch the engine with your preferred VRAM allocation:
 
 ## 📊 Technical Verification & Results
 
-Verified on consumer hardware (**NVIDIA GeForce RTX 3060 6GB Laptop GPU / 16 GB DDR4 RAM**):
+Measured by the author on **NVIDIA GeForce RTX 3060 12 GB (desktop) / 16 GB DDR4 RAM**, with the engine's VRAM budget capped at **6.0 GB** (`--vram 6.0`). This emulates a 6 GB budget; it is not a run on a physical 6 GB card (driver reservations and display usage differ). A reproducible benchmark script is planned (roadmap R5); throughput figures will be published with it.
 - **Model:** `Qwen2.5-14B-Instruct` (48 Layers, Hidden Dim: 5120, Intermediate: 13824, Heads: 40, KV Heads: 8, Vocab: 152064).
-- **VRAM Footprint:** Fits comfortably within a **6.0 GB VRAM envelope**.
+- **VRAM Footprint:** Runs within the **6.0 GB VRAM budget**.
 - **Execution:** Layers 0–20 reside permanently in GPU VRAM; Layers 21–47 are streamed from Host Pinned RAM via dual-stream ping-pong buffers.
 - **Latency:** Zero disk I/O during generation; smooth real-time token streaming to console with coherent, logically sound outputs.
 
@@ -190,10 +200,13 @@ Verified on consumer hardware (**NVIDIA GeForce RTX 3060 6GB Laptop GPU / 16 GB 
 
 > *"High-performance systems programming is not about adding more abstractions; it is about eliminating unnecessary ones until only compute and memory remain."*
 
-FRIDAY Engine was built to prove that cutting-edge 14-Billion parameter foundation models can run efficiently on modest consumer hardware when stripped of framework overhead.
+FRIDAY Engine explores how far 14-billion-parameter models can be pushed on modest consumer hardware when framework overhead is removed.
 
 ---
 
 ## 📄 License
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+## 🙏 Acknowledgements
+AI-assisted tooling was used during development.
 
