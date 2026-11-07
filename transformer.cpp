@@ -60,6 +60,24 @@ __global__ void dequantize_q4_0_row_kernel(const uint8_t* q4_data, half* fp16_ou
     fp16_out[idx] = __float2half(val);
 }
 
+// GGML Q2_K row dequant for token embeddings: one thread per element,
+// 84-byte blocks of 256 values (16 scale bytes, 64 quant bytes, fp16 d, fp16 dmin).
+__global__ void dequantize_q2_K_row_kernel(const uint8_t* row, half* out, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    const uint8_t* b = row + (idx / 256) * 84;
+    const uint8_t* scales = b;
+    const uint8_t* qs = b + 16;
+    const half d = *reinterpret_cast<const half*>(b + 80);
+    const half dmin = *reinterpret_cast<const half*>(b + 82);
+    int r = idx % 256, h = r / 128, j = (r % 128) / 32, l = r % 32;
+    uint8_t sc = scales[h * 8 + j * 2 + (l >= 16 ? 1 : 0)];
+    int q = (qs[h * 32 + l] >> (2 * j)) & 3;
+    float v = __half2float(d) * (float)(sc & 0x0F) * (float)q
+            - __half2float(dmin) * (float)(sc >> 4);
+    out[idx] = __float2half(v);
+}
+
 QuantType Transformer::getQuantTypeFromDtype(const std::string& dtype_str) {
     if (dtype_str == "F16" || dtype_str == "F32") return FP16;
     if (dtype_str == "Q4_0") return INT4;
@@ -742,6 +760,18 @@ bool Transformer::getEmbedding(int token_id, half* d_output, int vocab_size, cud
         dequantize_q4_0_row_kernel<<<blocks, threads, 0, stream>>>(d_row_ptr, d_output, hidden_dim_);
         CUDA_CHECK(cudaGetLastError());
         return true;
+    }
+    if (t_info.dtype == "Q2_K") {
+        const size_t row_bytes = (size_t)(hidden_dim_ / 256) * 84;
+        const uint8_t* d_row = (const uint8_t*)d_token_embd_ + (size_t)token_id * row_bytes;
+        dequantize_q2_K_row_kernel<<<(hidden_dim_ + 255) / 256, 256, 0, stream>>>(d_row, d_output, hidden_dim_);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (t_info.dtype != "F16") {
+        // Previously every other dtype was copied as raw FP16, which read out of bounds.
+        fprintf(stderr, "getEmbedding: unsupported embedding dtype '%s'\n", t_info.dtype.c_str());
+        return false;
     }
 
     size_t offset = (size_t)token_id * hidden_dim_ * sizeof(half);
