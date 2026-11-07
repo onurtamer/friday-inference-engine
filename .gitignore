@@ -56,7 +56,6 @@ friday_cli.py
 friday_engine.*
 friday_poc_windows.*
 sdem_reader.h
-friday_types.h
 *.log
 upload_to_github.ps1
 tokenizer_config.json
