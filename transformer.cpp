@@ -17,7 +17,7 @@ __global__ void addResidualKernel(half* d_target, const half* d_addend, int size
 __global__ void addBiasF32Kernel(half* d_target, const float* d_bias, int size);
 
 // Diagnostic helper
-static void checkBufferNaNs(const half* d_buf, int size, const char* name, cudaStream_t stream) {
+[[maybe_unused]] static void checkBufferNaNs(const half* d_buf, int size, const char* name, cudaStream_t stream) {
     std::vector<half> h_buf(size);
     cudaMemcpyAsync(h_buf.data(), d_buf, size * sizeof(half), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
@@ -801,7 +801,9 @@ void Transformer::forward(
     CUDA_CHECK(cudaMemsetAsync(d_up_out_, 0, max_intermediate_size_ * sizeof(half), compute_stream));
 
     if (pos_offset == 0) {
+#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
         checkBufferNaNs(d_input_activations, hidden_dim_, "L0 initial input_activations", compute_stream);
+#endif
     }
 
     // =========================================================================
@@ -965,7 +967,9 @@ void Transformer::forward(
             hidden_dim_,
             compute_stream
         );
+#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
         checkBufferNaNs(d_input_activations, hidden_dim_, "post-final-norm activations", compute_stream);
+#endif
     }
 
     // LM Head (Output Projeksiyonu)
@@ -986,7 +990,9 @@ void Transformer::forward(
             compute_stream
         );
         CUDA_CHECK(cudaGetLastError());
+#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
         checkBufferNaNs(d_output_logits, (int)lm_head_info.shape[1], "LM Head output logits", compute_stream);
+#endif
     }
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));

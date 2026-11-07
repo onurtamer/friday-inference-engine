@@ -331,6 +331,61 @@ void hpc_q4_K_gemv_kernel(const block_q4_K* __restrict__ W,
     }
 }
 
+
+// ----------------------------------------------------------------------------
+// 4b. Q6_K HPC KERNEL (warp per row, coalesced byte loads)
+// GGML block_q6_K: ql[128] (low 4 bits), qh[64] (high 2 bits), int8 scales[16], fp16 d.
+// Per 128-value half h: lane l produces values at offsets l, l+32, l+64, l+96.
+// ----------------------------------------------------------------------------
+#pragma pack(push, 1)
+struct hpc_block_q6_K {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t  scales[16];
+    half    d;
+};
+#pragma pack(pop)
+static_assert(sizeof(hpc_block_q6_K) == 210, "K-Quant ABI Violation: Q6_K size mismatch!");
+
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void hpc_q6_K_gemv_kernel(const hpc_block_q6_K* __restrict__ W,
+                          const half* __restrict__ x,
+                          half* __restrict__ y,
+                          int N, int K)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= N) return;
+
+    const int nb = K / QK_K;
+    const hpc_block_q6_K* __restrict__ w = W + (size_t)row * nb;
+    float acc = 0.0f;
+
+    for (int sb = 0; sb < nb; ++sb) {
+        const float d = __half2float(w[sb].d);
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t ql0 = w[sb].ql[h * 64 + lane];
+            const uint8_t ql1 = w[sb].ql[h * 64 + lane + 32];
+            const uint8_t qh  = w[sb].qh[h * 32 + lane];
+            const int8_t* sc  = w[sb].scales + h * 8 + (lane >> 4);
+            const int q1 = (int)((ql0 & 0x0F) | (((qh >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql1 & 0x0F) | (((qh >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql0 >> 4)   | (((qh >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql1 >> 4)   | (((qh >> 6) & 3) << 4)) - 32;
+            const int base = sb * QK_K + h * 128 + lane;
+            acc += d * (float)sc[0] * (float)q1 * __half2float(x[base]);
+            acc += d * (float)sc[2] * (float)q2 * __half2float(x[base + 32]);
+            acc += d * (float)sc[4] * (float)q3 * __half2float(x[base + 64]);
+            acc += d * (float)sc[6] * (float)q4 * __half2float(x[base + 96]);
+        }
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
 // ----------------------------------------------------------------------------
 // 5. HOST LAUNCHERS & TELEMETRY INFRASTRUCTURE
 // ----------------------------------------------------------------------------
@@ -372,6 +427,12 @@ void launch_q4_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaSt
         case VAR_KAHAN: hpc_q4_K_gemv_kernel<kWarpsPerBlock, VAR_KAHAN><<<grid, block, 0, s>>>(static_cast<const block_q4_K*>(W), x, y, N, K); break;
         default:        hpc_q4_K_gemv_kernel<kWarpsPerBlock, VAR_CURRENT><<<grid, block, 0, s>>>(static_cast<const block_q4_K*>(W), x, y, N, K); break;
     }
+}
+
+void launch_q6_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    const dim3 grid((N + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    const dim3 block(kWarpsPerBlock * WARP_SIZE);
+    hpc_q6_K_gemv_kernel<kWarpsPerBlock><<<grid, block, 0, s>>>(static_cast<const hpc_block_q6_K*>(W), x, y, N, K);
 }
 
 } // namespace friday_hpc

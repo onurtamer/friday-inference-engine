@@ -15,6 +15,7 @@ namespace friday_hpc {
     extern void launch_q2_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
     extern void launch_q3_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
     extern void launch_q4_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
+    extern void launch_q6_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
 }
 
 void FridayKernelDispatcher::dispatchGemvKernel(
@@ -71,14 +72,9 @@ void FridayKernelDispatcher::dispatchGemvKernel(
             break;
         }
         case Q6_K: {
-            launchQ6_KGemvKernel(
-                d_activations,
-                static_cast<const block_q6_K*>(d_weights),
-                d_output,
-                K,
-                N,
-                stream
-            );
+            // Warp-per-row coalesced kernel (hpc_k_quants.cu). The previous
+            // thread-per-row launchQ6_KGemvKernel read memory uncoalesced.
+            friday_hpc::launch_q6_K_hpc(d_activations, d_weights, d_output, K, N, stream);
             break;
         }
         

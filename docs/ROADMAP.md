@@ -34,6 +34,10 @@ recorded, docs updated, commit reviewed.
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).
   Goal: exceed llama.cpp on the same hardware and model.
+  - Step 1 (2026-11-08): warp-per-row Q6_K GEMV for the LM head (was 225 ms/token,
+    thread-per-row, uncoalesced) → 2.42 tok/s decode, 2.78 tok/s prefill.
+    Remaining per-token cost: CPU attention + copies ~190 ms, MLP GEMV ~171 ms
+    (~16% of memory bandwidth), PCIe streaming ~42 ms.
 
 ## v1.0 — public local inference engine
 
