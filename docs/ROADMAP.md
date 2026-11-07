@@ -7,15 +7,28 @@ tracked in git. Decisions that change v1 scope are recorded as ADRs in
 Every milestone ends with: tests passing (also under NDEBUG), measurements
 recorded, docs updated, commit reviewed.
 
+## Priorities (2026-11-07)
+
+- **P0 — correctness blockers (R1):** token embedding for K-quant types;
+  a real BPE tokenizer matching the reference tokenizer; golden and kernel
+  tests running under CTest.
+- **P1 — decode throughput (R4, CUDA path first):** reach at least 60% of the
+  computed ceiling (VRAM bandwidth for resident layers + PCIe for streamed
+  layers). Baseline measured 2026-11-07 on RTX 3060 12 GB with
+  Qwen2.5-32B Q2_K, 55/64 layers resident: 1.5–1.6 tok/s decode against an
+  estimated ceiling of ~10 tok/s.
+- **Order:** R0 → R1 → R4 (CUDA) → R5 → R2 → R3 → R6 → R7 → R8.
+  ARM-side optimizations follow with the backend HAL in R3.
+
 ## v1.0 — public local inference engine
 
 | ID | Milestone | Exit gate |
 |----|-----------|-----------|
 | R0 | Repo hygiene & reproducible build | Clean clone builds via CMake; tests run under CTest; LICENSE, honest README; stale scripts moved out; secret/personal-path scan clean |
-| R1 | Correctness foundation | Per-model golden tests; tokenizer matches reference byte-for-byte; logits within tolerance of a reference runtime; KV layout bug fixed; ASAN + compute-sanitizer clean |
+| R1 | Correctness foundation | Per-model golden tests; tokenizer matches reference byte-for-byte; kernel tests against GGUF reference dequantization for every supported quant type; logits within tolerance of a reference runtime; KV layout bug fixed; ASAN + compute-sanitizer clean |
 | R2 | Model loading | Direct GGUF parsing (no tensor_map/convert step); model registry with hash, license, architecture; Qwen2.5/3 + Llama/Mistral |
 | R3 | Backend + platform HAL (Windows and Linux) | Backend interface; CUDA backend from existing kernels; CPU backend (AVX2 + NEON); capability report; ARM cross-compile + QEMU tests |
-| R4 | Measured optimizations | GPU attention/KV (currently CPU), batched prefill, kernel fusion, kernel-bypass memory/IO; per-platform before/after measurements and numerical diff |
+| R4 | Measured optimizations | Profile first; GPU attention/KV (currently CPU), non-blocking streams, bandwidth-efficient GEMV, CUDA Graphs and kernel fusion, batched prefill, kernel-bypass memory/IO; decode ≥60% of the computed ceiling; per-platform before/after tok/s and numerical diff |
 | R5 | Benchmarks & performance model | Measured table (RTX 3060, Ryzen 5600X); estimate table for other GPUs/ARM boards; published methodology |
 | R6 | Chat & persistent memory | Per-model chat templates; sessions; SQLite + FTS memory with provenance, edit and delete |
 | R7 | API server & router | OpenAI-compatible HTTP, SSE streaming, cancel, queue, multi-model routing; localhost default, token auth |
