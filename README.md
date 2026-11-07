@@ -175,6 +175,16 @@ Launch the engine with your preferred VRAM allocation:
 .\build\Release\FridayEngine.exe --vram 6.0 friday_aligned_int4.bin
 ```
 
+### Step 5: Run the Tests
+```bash
+cmake -B build -A x64 -DFRIDAY_MODEL_DIR=<dir with friday_aligned_int4.bin, tensor_map.json, tokenizer_config.json>
+cmake --build build --config Release
+ctest --test-dir build -C Release -L unit    # CPU only, < 10 s
+ctest --test-dir build -C Release -L gpu     # GPU kernels vs. gguf reference (needs Python gguf + numpy)
+ctest --test-dir build -C Release -L model   # end-to-end regression snapshot, ~1 min
+```
+Tests labelled `known-failing` document open defects (for example, the tokenizer does not yet apply BPE merges) and are expected to fail until fixed.
+
 ---
 
 ## ⚙️ Command-Line Interface (CLI)

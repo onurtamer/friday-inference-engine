@@ -6,40 +6,48 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-find_package(CUDA REQUIRED)
+# Default: sm_86 (RTX 30-series). Override with -DCMAKE_CUDA_ARCHITECTURES=...
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "86")
+endif()
 
-set(SOURCES
-    main.cpp
+find_package(CUDAToolkit REQUIRED)
+
+option(FRIDAY_BUILD_TESTS "Build the test suite" ON)
+
+add_compile_options(-O3)
+
+# Engine library: everything except the CLI entry point.
+set(FRIDAY_ENGINE_SOURCES
     tokenizer.cpp
     transformer.cpp
-    io_manager.cpp 
-    memory_manager.cpp 
+    io_manager.cpp
+    memory_manager.cpp
     cuda_math_kernels.cu
     int4_kernel.cu
     kernel_dispatcher.cpp
     hpc_k_quants.cu
 )
+set_source_files_properties(${FRIDAY_ENGINE_SOURCES} main.cpp PROPERTIES LANGUAGE CUDA)
 
-add_compile_options(-O3)
-
-# sm_86 for RTX 3060 (user's hardware)
-set(CMAKE_CUDA_ARCHITECTURES "86")
-
-if(UNIX AND NOT APPLE)
-    message(STATUS "Building on Linux: linking libaio and pthread.")
-    target_link_libraries(FridayEngine PRIVATE aio pthread)
-elseif(WIN32)
-    message(STATUS "Building on Windows: standard libraries assumed.")
-endif()
-
-set_source_files_properties(${SOURCES} PROPERTIES LANGUAGE CUDA)
-add_executable(FridayEngine ${SOURCES})
-
-set_target_properties(FridayEngine PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
-target_include_directories(FridayEngine PRIVATE
+add_library(friday_engine STATIC ${FRIDAY_ENGINE_SOURCES})
+set_target_properties(friday_engine PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_include_directories(friday_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+if(UNIX AND NOT APPLE)
+    # Linux builds are untested (see README).
+    find_package(Threads REQUIRED)
+    target_link_libraries(friday_engine PUBLIC Threads::Threads)
+endif()
+
+# CLI executable.
+add_executable(FridayEngine main.cpp)
+set_target_properties(FridayEngine PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(FridayEngine PRIVATE friday_engine)
+
+if(FRIDAY_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
