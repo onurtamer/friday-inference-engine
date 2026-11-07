@@ -139,13 +139,16 @@ private:
     std::vector<unsigned char*> d_gpu_resident_layers_;
     std::vector<unsigned char*> h_offload_pinned_cache_;
 
-    // Sadece akitilan (stream edilen) katmanlar icin Ping-Pong tamponlari
-    unsigned char* d_layer_buffer_A_ = nullptr;
-    unsigned char* d_layer_buffer_B_ = nullptr;
-
-    // Gerçek asenkron DMA transferleri için Pinned Host Buffer'lar
-    unsigned char* h_pinned_buffer_A_ = nullptr;
-    unsigned char* h_pinned_buffer_B_ = nullptr;
+    // DMA slots for host-streamed layers (triple buffering).
+    static constexpr int kDmaSlotCount = 3;
+    unsigned char* d_layer_buffer_[kDmaSlotCount] = {nullptr, nullptr, nullptr};
+    // Pinned staging buffers, used only when a layer is not in the pinned host cache.
+    unsigned char* h_pinned_buffer_[kDmaSlotCount] = {nullptr, nullptr, nullptr};
+    // ev_slot_free_[i]: compute has finished reading slot i.
+    // ev_slot_ready_[i]: the copy into slot i has finished.
+    cudaEvent_t ev_slot_free_[kDmaSlotCount] = {};
+    cudaEvent_t ev_slot_ready_[kDmaSlotCount] = {};
+    bool slot_events_created_ = false;
 
     size_t layer_buffer_size_ = 0;
     std::vector<LayerInfo> layers_info_;

@@ -1,4 +1,5 @@
 #include "transformer.h"
+#include <stdexcept>
 #include "io_manager.h"
 #include "kernel_dispatcher.h"
 #include <fstream>
@@ -61,11 +62,14 @@ __global__ void dequantize_q4_0_row_kernel(const uint8_t* q4_data, half* fp16_ou
 
 QuantType Transformer::getQuantTypeFromDtype(const std::string& dtype_str) {
     if (dtype_str == "F16" || dtype_str == "F32") return FP16;
-    if (dtype_str == "Q4_0" || dtype_str == "Q4_K") return INT4;
+    if (dtype_str == "Q4_0") return INT4;
     if (dtype_str == "Q4_1") return Q4_1;
     if (dtype_str == "Q8_0" || dtype_str == "Q8_1") return INT8;
     if (dtype_str == "Q6_K") return Q6_K;
     if (dtype_str == "TERNARY") return TERNARY;
+    if (dtype_str == "Q2_K") return Q2_K;
+    if (dtype_str == "Q3_K") return Q3_K;
+    if (dtype_str == "Q4_K") return Q4_K;
     return UNKNOWN;
 }
 
@@ -187,62 +191,59 @@ Transformer::Transformer(
     }
 
     // =========================================================================
-    // V32: Esnek Hibrit Bellek (Elastic Tiered Memory) Tahsis Stratejisi
+    // Dynamic VRAM residency planner
+    // Budget = free VRAM after static allocations (optionally capped by --vram),
+    // minus a fixed safety reserve and the DMA slot reservation. Layers are
+    // placed on the GPU in order until the budget is exhausted; the count is
+    // fixed after construction (no cudaMalloc/cudaFree during decoding).
     // =========================================================================
-    size_t free_bytes = 0, total_bytes = 0;
-    cudaMemGetInfo(&free_bytes, &total_bytes);
+    size_t free_bytes_before_residency = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes_before_residency, &total_bytes));
 
-    size_t usable_for_layers = 0;
+    const size_t kMinGpuReserveBytes = 384ULL * 1024ULL * 1024ULL;
+    const size_t dma_reservation = (size_t)kDmaSlotCount * layer_buffer_size_;
+    const size_t required_overhead = kMinGpuReserveBytes + dma_reservation;
+
+    size_t budget = free_bytes_before_residency;
     if (vram_limit_gb_ > 0.1) {
-        size_t requested_total = (size_t)(vram_limit_gb_ * 1024ULL * 1024ULL * 1024ULL);
-        size_t already_used = total_bytes - free_bytes;
-        if (requested_total > already_used) {
-            usable_for_layers = requested_total - already_used;
-            if (usable_for_layers > free_bytes) usable_for_layers = free_bytes;
-        } else {
-            usable_for_layers = 0;
-        }
-    } else {
-        // Otomatik mod: 768 MB guvenlik marji birak
-        size_t safety_margin = 768ULL * 1024ULL * 1024ULL;
-        usable_for_layers = (free_bytes > safety_margin) ? (free_bytes - safety_margin) : free_bytes;
+        const size_t requested_total = (size_t)(vram_limit_gb_ * 1024.0 * 1024.0 * 1024.0);
+        const size_t already_used = total_bytes - free_bytes_before_residency;
+        const size_t capped = (requested_total > already_used) ? (requested_total - already_used) : 0;
+        if (capped < budget) budget = capped;
     }
 
-    size_t total_layers_needed = (size_t)num_layers_ * layer_buffer_size_;
-    if (usable_for_layers >= total_layers_needed) {
-        num_gpu_resident_layers_ = num_layers_;
-    } else {
-        size_t ring_buffer_pair = 2 * layer_buffer_size_;
-        if (usable_for_layers > ring_buffer_pair) {
-            num_gpu_resident_layers_ = (int)((usable_for_layers - ring_buffer_pair) / layer_buffer_size_);
-        } else {
-            num_gpu_resident_layers_ = 0;
-        }
+    if (budget < required_overhead) {
+        throw std::runtime_error(
+            "VRAM budget too small: " + std::to_string(budget / (1024 * 1024)) +
+            " MiB available, " + std::to_string(required_overhead / (1024 * 1024)) +
+            " MiB required for DMA slots and safety reserve");
     }
-    if (num_gpu_resident_layers_ > num_layers_) num_gpu_resident_layers_ = num_layers_;
-    if (num_gpu_resident_layers_ < 0) num_gpu_resident_layers_ = 0;
 
-    int num_offload = num_layers_ - num_gpu_resident_layers_;
+    size_t available_for_resident = budget - required_overhead;
+    num_gpu_resident_layers_ = 0;
+    size_t resident_weight_bytes = 0;
+    for (int i = 0; i < num_layers_; ++i) {
+        const size_t l_size = layers_info_[i].size_bytes;
+        if (available_for_resident < l_size) break;
+        available_for_resident -= l_size;
+        resident_weight_bytes += l_size;
+        num_gpu_resident_layers_++;
+    }
+    const int num_streamed = num_layers_ - num_gpu_resident_layers_;
 
     printf("\n=======================================================\n");
-    printf("  [V32] Esnek Hibrit Bellek (Elastic Tiered Memory)\n");
-    printf("  Toplam VRAM: %.2f GB | Serbest VRAM: %.2f GB\n",
-           (float)total_bytes / (1024.0f * 1024.0f * 1024.0f),
-           (float)free_bytes / (1024.0f * 1024.0f * 1024.0f));
-    if (vram_limit_gb_ > 0.1) {
-        printf("  Kullanici VRAM Limiti: %.2f GB\n", vram_limit_gb_);
-    } else {
-        printf("  VRAM Modu: Otomatik Algilama (Maksimum GPU Gucu)\n");
-    }
-    printf("  Katman Boyutu: %.2f MB | Toplam Katman: %d\n",
-           (float)layer_buffer_size_ / (1024.0f * 1024.0f), num_layers_);
-    printf("  -> GPU VRAM'de Sabit Yerlesik Katmanlar: %d / %d (%.2f GB)\n",
-           num_gpu_resident_layers_, num_layers_,
-           (float)(num_gpu_resident_layers_ * layer_buffer_size_) / (1024.0f * 1024.0f * 1024.0f));
-    printf("  -> Asenkron Stream Edilecek Katmanlar : %d / %d (%.2f GB)\n",
-           num_offload, num_layers_,
-           (float)(num_offload * layer_buffer_size_) / (1024.0f * 1024.0f * 1024.0f));
+    printf("  VRAM total: %.2f GB | free before layers: %.2f GB",
+           (double)total_bytes / (1u << 30), (double)free_bytes_before_residency / (1u << 30));
+    if (vram_limit_gb_ > 0.1) printf(" | --vram cap: %.2f GB", vram_limit_gb_);
+    printf("\n  Reserved: %zu MiB safety + %zu MiB DMA (%d slots)\n",
+           kMinGpuReserveBytes >> 20, dma_reservation >> 20, kDmaSlotCount);
+    printf("  GPU-resident layers: %d / %d (%.2f GB) | host-streamed: %d\n",
+           num_gpu_resident_layers_, num_layers_, (double)resident_weight_bytes / (1u << 30), num_streamed);
     printf("=======================================================\n\n");
+
+    // Streams are created before any event is recorded on them.
+    CUDA_CHECK(cudaStreamCreate(&stream_compute_));
+    CUDA_CHECK(cudaStreamCreate(&stream_io_));
 
     // 1. GPU'da kalici tutulacak katmanlari yukle
     d_gpu_resident_layers_.resize(num_gpu_resident_layers_, nullptr);
@@ -257,20 +258,25 @@ Transformer::Transformer(
         printf("[Transformer] %d adet katman GPU VRAM'e kalici yuklendi (Sifir transfer gecikmesi).\n", num_gpu_resident_layers_);
     }
 
-    // 2. Stream edilecek katmanlar varsa, Ping-Pong tamponlari ve Host Onbellegi hazirla
-    if (num_offload > 0) {
-        CUDA_CHECK(cudaMalloc((void**)&d_layer_buffer_A_, layer_buffer_size_));
-        CUDA_CHECK(cudaMalloc((void**)&d_layer_buffer_B_, layer_buffer_size_));
-        CUDA_CHECK(cudaMemset(d_layer_buffer_A_, 0, layer_buffer_size_));
-        CUDA_CHECK(cudaMemset(d_layer_buffer_B_, 0, layer_buffer_size_));
-
-        CUDA_CHECK(cudaMallocHost((void**)&h_pinned_buffer_A_, layer_buffer_size_));
-        CUDA_CHECK(cudaMallocHost((void**)&h_pinned_buffer_B_, layer_buffer_size_));
+    // 2. Stream edilecek katmanlar varsa, DMA slotlarini ve Host Onbellegi hazirla
+    if (num_streamed > 0) {
+        for (int i = 0; i < kDmaSlotCount; ++i) {
+            CUDA_CHECK(cudaMalloc((void**)&d_layer_buffer_[i], layer_buffer_size_));
+            CUDA_CHECK(cudaMemset(d_layer_buffer_[i], 0, layer_buffer_size_));
+            CUDA_CHECK(cudaMallocHost((void**)&h_pinned_buffer_[i], layer_buffer_size_));
+            // ev_slot_free_[i]: compute finished reading slot i (safe to overwrite).
+            // ev_slot_ready_[i]: copy into slot i finished (safe to compute on).
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_slot_free_[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_slot_ready_[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(ev_slot_free_[i], stream_compute_));
+            CUDA_CHECK(cudaEventRecord(ev_slot_ready_[i], stream_io_));
+        }
+        slot_events_created_ = true;
 
         // Offloaded katmanlari sistem RAM'inde (Pinned Host) onbellekle
-        h_offload_pinned_cache_.resize(num_offload, nullptr);
+        h_offload_pinned_cache_.resize(num_streamed, nullptr);
         bool all_pinned_ok = true;
-        for (int i = 0; i < num_offload; ++i) {
+        for (int i = 0; i < num_streamed; ++i) {
             int l_idx = num_gpu_resident_layers_ + i;
             const auto& l_info = layers_info_[l_idx];
             cudaError_t err = cudaMallocHost((void**)&h_offload_pinned_cache_[i], l_info.size_bytes);
@@ -287,14 +293,11 @@ Transformer::Transformer(
             }
         }
         if (all_pinned_ok && !h_offload_pinned_cache_.empty()) {
-            printf("[Transformer] %d adet dis katman Sistem RAM'ine (Pinned Memory) onbelleklendi (Cikarim sirasinda 0 Disk I/O!).\n", num_offload);
+            printf("[Transformer] %d adet dis katman Sistem RAM'ine (Pinned Memory) onbelleklendi (Cikarim sirasinda 0 Disk I/O!).\n", num_streamed);
         } else {
-            printf("[Transformer] Uyari: Host RAM siniri nedeniyle %d dis katman kalici dosya handle'i ile stream edilecek.\n", num_offload);
+            printf("[Transformer] Uyari: Host RAM siniri nedeniyle %d dis katman kalici dosya handle'i ile stream edilecek.\n", num_streamed);
         }
     }
-
-    CUDA_CHECK(cudaStreamCreate(&stream_compute_));
-    CUDA_CHECK(cudaStreamCreate(&stream_io_));
 }
 
 // Destructor: GPU ve Host belleklerini temizler
@@ -310,10 +313,14 @@ Transformer::~Transformer() {
     }
     h_offload_pinned_cache_.clear();
 
-    if (d_layer_buffer_A_) CUDA_CHECK(cudaFree(d_layer_buffer_A_));
-    if (d_layer_buffer_B_) CUDA_CHECK(cudaFree(d_layer_buffer_B_));
-    if (h_pinned_buffer_A_) CUDA_CHECK(cudaFreeHost(h_pinned_buffer_A_));
-    if (h_pinned_buffer_B_) CUDA_CHECK(cudaFreeHost(h_pinned_buffer_B_));
+    for (int i = 0; i < kDmaSlotCount; ++i) {
+        if (slot_events_created_) {
+            CUDA_CHECK(cudaEventDestroy(ev_slot_free_[i]));
+            CUDA_CHECK(cudaEventDestroy(ev_slot_ready_[i]));
+        }
+        if (d_layer_buffer_[i]) CUDA_CHECK(cudaFree(d_layer_buffer_[i]));
+        if (h_pinned_buffer_[i]) CUDA_CHECK(cudaFreeHost(h_pinned_buffer_[i]));
+    }
 
     if (d_token_embd_) CUDA_CHECK(cudaFree(d_token_embd_));
     if (d_output_norm_) CUDA_CHECK(cudaFree(d_output_norm_));
@@ -826,38 +833,47 @@ void Transformer::forward(
 
     // 2. Kalan stream edilecek katmanlar (num_gpu_resident_layers_ .. num_layers_ - 1)
     if (num_gpu_resident_layers_ < num_layers_) {
-        int first_stream_layer = num_gpu_resident_layers_;
-        const auto& l_first_info = layers_info_[first_stream_layer];
+        const int first_stream_layer = num_gpu_resident_layers_;
 
-        // Ilk stream katmanini Buffer A'ya yukle
-        if (!h_offload_pinned_cache_.empty()) {
-            CUDA_CHECK(cudaMemcpyAsync(d_layer_buffer_A_, h_offload_pinned_cache_[0], l_first_info.size_bytes, cudaMemcpyHostToDevice, compute_stream));
-        } else {
-            async_io_manager_ptr_->readLayerToHost(l_first_info.start_offset, l_first_info.size_bytes, h_pinned_buffer_A_);
-            CUDA_CHECK(cudaMemcpyAsync(d_layer_buffer_A_, h_pinned_buffer_A_, l_first_info.size_bytes, cudaMemcpyHostToDevice, compute_stream));
-        }
-        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        // Issue the host->device copy of streamed layer `offload_idx` into DMA slot `slot`
+        // on stream_io_. Ordering is enforced with per-slot events only:
+        //   copy waits for ev_slot_free_[slot]  (compute is done reading the slot)
+        //   compute waits for ev_slot_ready_[slot] (copy into the slot is done)
+        auto enqueue_layer_copy = [&](int offload_idx, int slot) {
+            const auto& info = layers_info_[first_stream_layer + offload_idx];
+            CUDA_CHECK(cudaStreamWaitEvent(stream_io_, ev_slot_free_[slot], 0));
+            const unsigned char* src = nullptr;
+            if (!h_offload_pinned_cache_.empty() && h_offload_pinned_cache_[offload_idx]) {
+                src = h_offload_pinned_cache_[offload_idx];
+            } else {
+                // Fallback: read from disk into this slot's pinned staging buffer.
+                // Wait until the previous copy out of that staging buffer has finished.
+                CUDA_CHECK(cudaEventSynchronize(ev_slot_ready_[slot]));
+                if (!async_io_manager_ptr_->readLayerToHost(info.start_offset, info.size_bytes, h_pinned_buffer_[slot])) {
+                    throw std::runtime_error("Failed to read streamed layer " +
+                                             std::to_string(first_stream_layer + offload_idx) + " from disk");
+                }
+                src = h_pinned_buffer_[slot];
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d_layer_buffer_[slot], src, info.size_bytes,
+                                       cudaMemcpyHostToDevice, stream_io_));
+            CUDA_CHECK(cudaEventRecord(ev_slot_ready_[slot], stream_io_));
+        };
 
-        unsigned char* d_curr_buf = d_layer_buffer_A_;
-        unsigned char* d_next_buf = d_layer_buffer_B_;
-        unsigned char* h_curr_pinned = h_pinned_buffer_A_;
-        unsigned char* h_next_pinned = h_pinned_buffer_B_;
+        enqueue_layer_copy(0, 0);
 
         for (int layer_idx = first_stream_layer; layer_idx < num_layers_; ++layer_idx) {
-            int offload_idx = layer_idx - first_stream_layer;
+            const int offload_idx = layer_idx - first_stream_layer;
+            const int curr_slot = offload_idx % kDmaSlotCount;
+            const int next_slot = (offload_idx + 1) % kDmaSlotCount;
 
-            // Bir sonraki katmani stream_io_ ile arka planda kopyala
+            // Prefetch the next streamed layer while this one is computed.
             if (layer_idx + 1 < num_layers_) {
-                int next_offload_idx = offload_idx + 1;
-                const auto& next_l_info = layers_info_[layer_idx + 1];
-                if (!h_offload_pinned_cache_.empty()) {
-                    CUDA_CHECK(cudaMemcpyAsync(d_next_buf, h_offload_pinned_cache_[next_offload_idx], next_l_info.size_bytes, cudaMemcpyHostToDevice, stream_io_));
-                } else {
-                    async_io_manager_ptr_->readLayerToHost(next_l_info.start_offset, next_l_info.size_bytes, h_next_pinned);
-                    CUDA_CHECK(cudaMemcpyAsync(d_next_buf, h_next_pinned, next_l_info.size_bytes, cudaMemcpyHostToDevice, stream_io_));
-                }
+                enqueue_layer_copy(offload_idx + 1, next_slot);
             }
 
+            CUDA_CHECK(cudaStreamWaitEvent(compute_stream, ev_slot_ready_[curr_slot], 0));
+            unsigned char* d_curr_buf = d_layer_buffer_[curr_slot];
             const auto& curr_l_info = layers_info_[layer_idx];
 
             // 1. RMSNorm
@@ -907,18 +923,9 @@ void Transformer::forward(
                 CUDA_CHECK(cudaGetLastError());
             }
 
-            // stream_compute_ senkronize et (katman hesaplamalari tamamlansin)
-            CUDA_CHECK(cudaStreamSynchronize(compute_stream));
-
-            // stream_io_ senkronize et ve Buffer A ile Buffer B isaretcilerini takas et (swap)
-            if (layer_idx + 1 < num_layers_) {
-                CUDA_CHECK(cudaStreamSynchronize(stream_io_));
-                std::swap(d_curr_buf, d_next_buf);
-                std::swap(h_curr_pinned, h_next_pinned);
-            }
+            CUDA_CHECK(cudaEventRecord(ev_slot_free_[curr_slot], compute_stream));
         }
     }
-
     // Final RMSNorm (Post-transformer norm, weights are F32)
     if (d_output_norm_) {
         applyRMSNorm(
