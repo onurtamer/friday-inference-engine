@@ -1,0 +1,12 @@
+# Normalize text files to LF in the repository and the working tree.
+* text=auto eol=lf
+
+# Binary artifacts (model weights, executables) are never converted.
+*.bin binary
+*.gguf binary
+*.safetensors binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.obj binary
+*.pdb binary
