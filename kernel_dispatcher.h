@@ -25,6 +25,9 @@ enum QuantType {
     TERNARY,
     Q4_1,
     Q6_K,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
     UNKNOWN
 };
 

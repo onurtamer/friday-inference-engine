@@ -17,6 +17,7 @@ set(SOURCES
     cuda_math_kernels.cu
     int4_kernel.cu
     kernel_dispatcher.cpp
+    hpc_k_quants.cu
 )
 
 add_compile_options(-O3)

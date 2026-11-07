@@ -10,6 +10,13 @@ extern void launchTernaryGemvKernel(const half* d_act, const unsigned char* d_we
 extern void launchGemvFP16Wrapper(const half* d_weights, const half* d_act, half* d_out, int K, int N, cudaStream_t stream);
 
 
+
+namespace friday_hpc {
+    extern void launch_q2_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
+    extern void launch_q3_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
+    extern void launch_q4_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
+}
+
 void FridayKernelDispatcher::dispatchGemvKernel(
     QuantType quant_type,
     const half* d_activations,
@@ -74,6 +81,20 @@ void FridayKernelDispatcher::dispatchGemvKernel(
             );
             break;
         }
+        
+        case Q2_K: {
+            friday_hpc::launch_q2_K_hpc(d_activations, d_weights, d_output, K, N, stream);
+            break;
+        }
+        case Q3_K: {
+            friday_hpc::launch_q3_K_hpc(d_activations, d_weights, d_output, K, N, stream);
+            break;
+        }
+        case Q4_K: {
+            friday_hpc::launch_q4_K_hpc(d_activations, d_weights, d_output, K, N, stream);
+            break;
+        }
+
         case UNKNOWN:
         default: {
             fprintf(stderr, "Error: Bilinmeyen veya desteklenmeyen nicelendirme tipi: %d\n", quant_type);
