@@ -1,6 +1,6 @@
 {
  "kind": "regression-snapshot",
- "note": "Output of this engine on 2026-11-07 (commit f059f3a, RTX 3060, 55/64 layers resident) with the engine tokenizer and the Qwen2.5 vocabulary. Detects unintended numerical changes; it is NOT a correctness oracle. Regenerate when the tokenizer or numerics change intentionally (roadmap R1).",
+ "note": "Output of this engine (RTX 3060, 55/64 layers resident) after the BPE tokenizer fix: prompt tokenized identically to the reference Qwen2 tokenizer (50 tokens). Detects unintended numerical changes; it is NOT a correctness oracle. Regenerate when the tokenizer or numerics change intentionally.",
  "tokens": [
   5609,
   5543,
@@ -18,7 +18,7 @@
   1027,
   18840,
   26976,
-  128848,
+  138287,
   15248,
   135292,
   855,
@@ -32,8 +32,8 @@
   125981,
   24836,
   33171,
-  138287,
-  15248
+  15248,
+  133029
  ],
- "text": "RAII (Resource Acquisition Is Initialization) prensibi, C++ dilinde önemli bir tasarım prensibidir ve kaynak yönetimi için kullanılan bir"
+ "text": "RAII (Resource Acquisition Is Initialization) prensibi, C++ dilinde kullanılan bir tasarım prensibidir ve kaynak yönetimi için bir yöntem"
 }

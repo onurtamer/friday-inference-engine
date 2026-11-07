@@ -1,210 +1,314 @@
 #include "tokenizer.h"
-#include <sstream>
+
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
 #include <stdexcept>
-#include <nlohmann/json.hpp> // JSON desteği eklendi
+#include <nlohmann/json.hpp>
+#include "unicode_tables.h"
 
-// Helper to trim whitespace from a string
-std::string trim(const std::string& str) {
-    size_t first = str.find_first_not_of(" \\t\\n\\r");
-    if (std::string::npos == first) {
-        return str;
+namespace {
+
+// ---------------------------------------------------------------------------
+// UTF-8 helpers
+// ---------------------------------------------------------------------------
+struct CodePoint {
+    uint32_t cp;     // 0xFFFFFFFF for an invalid byte
+    size_t offset;   // byte offset in the source string
+    size_t len;      // byte length
+};
+
+std::vector<CodePoint> decodeUtf8(const std::string& s) {
+    std::vector<CodePoint> out;
+    const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = p[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        bool ok = len > 0 && i + len <= n;
+        for (size_t k = 1; ok && k < len; ++k) ok = (p[i + k] & 0xC0) == 0x80;
+        if (!ok) { out.push_back({0xFFFFFFFFu, i, 1}); ++i; continue; }
+        uint32_t cp = len == 1 ? c : len == 2 ? (c & 0x1F) : len == 3 ? (c & 0x0F) : (c & 0x07);
+        for (size_t k = 1; k < len; ++k) cp = (cp << 6) | (p[i + k] & 0x3F);
+        out.push_back({cp, i, len});
+        i += len;
     }
-    size_t last = str.find_last_not_of(" \\t\\n\\r");
-    return str.substr(first, (last - first + 1));
+    return out;
 }
 
-// Minimal JSON-like parser for key-value pairs (replaced with nlohmann::json)
-bool Tokenizer::extractKeyValue(const std::string& line, std::string& key, std::string& value) {
-    size_t colon_pos = line.find(':');
-    if (colon_pos == std::string::npos) {
-        return false;
-    }
-    key = line.substr(0, colon_pos);
-    value = line.substr(colon_pos + 1);
-
-    key = trim(key);
-    value = trim(value);
-
-    // Remove surrounding quotes from key
-    if (key.length() >= 2 && key.front() == '\"' && key.back() == '\"' && key[1] != '\\') {
-        key = key.substr(1, key.length() - 2);
-    }
-    // Remove surrounding quotes from value if it's a string, and trailing comma
-    if (value.length() >= 2 && value.front() == '\"' && value.back() == '\"' && value[1] != '\\') {
-        value = value.substr(1, value.length() - 2);
-    } else if (value.length() >= 1 && value.back() == ',') { // For integer values with trailing comma
-        value = value.substr(0, value.length() - 1);
-    }
-    return true;
+std::string encodeUtf8(uint32_t cp) {
+    std::string s;
+    if (cp < 0x80) s += (char)cp;
+    else if (cp < 0x800) { s += (char)(0xC0 | (cp >> 6)); s += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { s += (char)(0xE0 | (cp >> 12)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
+    else { s += (char)(0xF0 | (cp >> 18)); s += (char)(0x80 | ((cp >> 12) & 0x3F)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F)); }
+    return s;
 }
 
+template <size_t N>
+bool inRanges(const uint32_t (&r)[N][2], uint32_t cp) {
+    size_t lo = 0, hi = N;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (cp < r[mid][0]) hi = mid;
+        else if (cp > r[mid][1]) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+bool isLetter(uint32_t cp) { return cp != 0xFFFFFFFFu && inRanges(kUnicodeLetterRanges, cp); }
+bool isNumber(uint32_t cp) { return cp != 0xFFFFFFFFu && inRanges(kUnicodeNumberRanges, cp); }
+bool isNewline(uint32_t cp) { return cp == '\r' || cp == '\n'; }
+// Unicode White_Space (matches \s of the regex engines used by HF tokenizers).
+bool isSpace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 || cp == 0xA0 || cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 || cp == 0x202F ||
+           cp == 0x205F || cp == 0x3000;
+}
+uint32_t asciiLower(uint32_t cp) { return (cp >= 'A' && cp <= 'Z') ? cp + 32 : cp; }
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Qwen2 pre-tokenizer. Implements, at each position, the first matching
+// alternative of:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
+//   | ' '?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// ---------------------------------------------------------------------------
+std::vector<std::string> Tokenizer::preTokenize(const std::string& text) {
+    const std::vector<CodePoint> cps = decodeUtf8(text);
+    const size_t n = cps.size();
+    std::vector<std::string> out;
+    size_t i = 0;
+    auto emit = [&](size_t a, size_t b) {  // codepoint range [a, b)
+        const size_t start = cps[a].offset;
+        const size_t end = cps[b - 1].offset + cps[b - 1].len;
+        out.push_back(text.substr(start, end - start));
+    };
+    while (i < n) {
+        const uint32_t c = cps[i].cp;
+        size_t end = 0;
+
+        // 1. contractions
+        if (c == '\'' && i + 1 < n) {
+            const uint32_t a = asciiLower(cps[i + 1].cp);
+            const uint32_t b = (i + 2 < n) ? asciiLower(cps[i + 2].cp) : 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') end = i + 2;
+            else if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) end = i + 3;
+        }
+        // 2. optional non-letter/number/newline prefix + letters
+        if (!end) {
+            size_t j = i;
+            if (!isNewline(c) && !isLetter(c) && !isNumber(c) && i + 1 < n && isLetter(cps[i + 1].cp)) j = i + 1;
+            if (isLetter(cps[j].cp)) {
+                while (j < n && isLetter(cps[j].cp)) ++j;
+                end = j;
+            }
+        }
+        // 3. single number
+        if (!end && isNumber(c)) end = i + 1;
+        // 4. optional space + punctuation/symbols + trailing newlines
+        if (!end) {
+            size_t j = (c == ' ') ? i + 1 : i;
+            size_t k = j;
+            while (k < n && !isSpace(cps[k].cp) && !isLetter(cps[k].cp) && !isNumber(cps[k].cp)) ++k;
+            if (k > j) {
+                while (k < n && isNewline(cps[k].cp)) ++k;
+                end = k;
+            }
+        }
+        // 5-7. whitespace
+        if (!end && isSpace(c)) {
+            size_t e = i;
+            while (e < n && isSpace(cps[e].cp)) ++e;
+            size_t last_nl = SIZE_MAX;
+            for (size_t k = i; k < e; ++k) if (isNewline(cps[k].cp)) last_nl = k;
+            if (last_nl != SIZE_MAX) end = last_nl + 1;          // \s*[\r\n]+
+            else if (e == n) end = e;                            // \s+(?!\S) at end of text
+            else if (e - i >= 2) end = e - 1;                    // \s+(?!\S): leave one space
+            else end = e;                                        // \s+
+        }
+        if (!end) end = i + 1;  // unreachable in practice; never stall
+        emit(i, end);
+        i = end;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 void Tokenizer::parseConfigFile(const std::string& config_path) {
     std::ifstream file(config_path);
     if (!file.is_open()) {
         throw std::runtime_error("Could not open tokenizer config file: " + config_path);
     }
-
     nlohmann::json j;
     try {
         file >> j;
     } catch (const nlohmann::json::exception& e) {
         throw std::runtime_error("Failed to parse tokenizer config file: " + std::string(e.what()));
     }
-
-    std::string current_map_type = ""; // "id_to_token" or "token_to_id"
-    // unk_token_id_ and eos_token_id_ refer to class members implicitly
-
-    for (auto& item : j.items()) {
-        std::string key = item.key();
-        if (key == "unk_token_id") {
-            this->unk_token_id_ = item.value().get<int>();
-        } else if (key == "eos_token_id") {
-            this->eos_token_id_ = item.value().get<int>();
-        } else if (key == "id_to_token") {
-            current_map_type = "id_to_token";
-            for (auto& token_item : item.value().items()) { // changed from item to item.value().items()
-                std::string id_str = token_item.key();
-                std::string token_str = token_item.value().get<std::string>();
-                id_to_token_[std::stoi(id_str)] = token_str;
-            }
-        } else if (key == "token_to_id") {
-            current_map_type = "token_to_id";
-            for (auto& token_item : item.value().items()) { // changed from item to item.value().items()
-                std::string token_str = token_item.key();
-                int token_id = token_item.value().get<int>();
-                token_to_id_[token_str] = token_id;
-            }
-        }
+    if (j.contains("unk_token_id") && j["unk_token_id"].is_number_integer()) unk_token_id_ = j["unk_token_id"];
+    if (j.contains("eos_token_id") && j["eos_token_id"].is_number_integer()) eos_token_id_ = j["eos_token_id"];
+    if (j.contains("id_to_token")) {
+        for (auto& it : j["id_to_token"].items()) id_to_token_[std::stoi(it.key())] = it.value().get<std::string>();
+    }
+    if (j.contains("token_to_id")) {
+        for (auto& it : j["token_to_id"].items()) token_to_id_[it.key()] = it.value().get<int>();
+    }
+    if (token_to_id_.empty()) {
+        for (const auto& p : id_to_token_) token_to_id_[p.second] = p.first;
+    }
+    if (j.contains("merges")) {
+        int rank = 0;
+        for (const auto& m : j["merges"]) merge_ranks_[m.get<std::string>()] = rank++;
     }
 
-    // Fallback for unk_token_id if not explicitly set
-    if (this->unk_token_id_ == -1 && !id_to_token_.empty()) {
-        if (token_to_id_.count("<s>")) {
-            this->unk_token_id_ = token_to_id_["<s>"];
-        } else if (token_to_id_.count("<<UNK>>")) {
-            this->unk_token_id_ = token_to_id_["<<UNK>>"];
-        } else if (token_to_id_.count("unknown")) {
-            this->unk_token_id_ = token_to_id_["unknown"];
-        } else if (!id_to_token_.empty()) {
-            // If unk_token_id is not explicitly set, try to find "unk_token_id" in the map keys
-            for (const auto& pair : id_to_token_) {
-                if (pair.second.find("unk") != std::string::npos || pair.second.find("unknown") != std::string::npos) {
-                    this->unk_token_id_ = pair.first;
-                    break;
-                }
-            }
+    // Special tokens: explicit list, or every vocab entry of the form <|...|>.
+    if (j.contains("special_tokens")) {
+        for (const auto& s : j["special_tokens"]) {
+            const std::string t = s.get<std::string>();
+            auto it = token_to_id_.find(t);
+            if (it != token_to_id_.end()) special_tokens_.push_back({t, it->second});
         }
-
-        if (unk_token_id_ == -1) {
-            std::cerr << "Warning: unk_token_id not found in config. Defaulting to -1 which might cause issues." << std::endl;
+    } else {
+        for (const auto& p : token_to_id_) {
+            const std::string& t = p.first;
+            if (t.size() > 4 && t.compare(0, 2, "<|") == 0 && t.compare(t.size() - 2, 2, "|>") == 0)
+                special_tokens_.push_back({t, p.second});
         }
-
-        std::cout << "Tokenizer config loaded from " << config_path << ". Vocab size: " << id_to_token_.size() << std::endl;
     }
+    std::sort(special_tokens_.begin(), special_tokens_.end(),
+              [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    for (const auto& s : special_tokens_) special_ids_.insert(s.second);
+
+    // GPT-2 byte <-> unicode alphabet.
+    int extra = 0;
+    for (int b = 0; b < 256; ++b) {
+        const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+        const uint32_t cp = printable ? (uint32_t)b : (uint32_t)(256 + extra++);
+        byte_encoder_[b] = encodeUtf8(cp);
+        byte_decoder_[byte_encoder_[b]] = (unsigned char)b;
+    }
+
+    if (unk_token_id_ == -1) {
+        auto it = token_to_id_.find("<unk>");
+        if (it != token_to_id_.end()) unk_token_id_ = it->second;
+    }
+    if (merge_ranks_.empty()) {
+        std::cerr << "Warning: tokenizer config has no merges; using the legacy greedy encoder, "
+                     "which does not match the reference tokenizer.\n";
+    }
+    std::cout << "Tokenizer config loaded from " << config_path << ". Vocab size: " << id_to_token_.size()
+              << ", merges: " << merge_ranks_.size() << ", special tokens: " << special_tokens_.size() << std::endl;
 }
 
 Tokenizer::Tokenizer(const std::string& config_path) {
     parseConfigFile(config_path);
 }
 
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
+void Tokenizer::encodeBpe(const std::string& piece, std::vector<int>& out) const {
+    std::vector<std::string> sym;
+    sym.reserve(piece.size());
+    for (unsigned char b : piece) sym.push_back(byte_encoder_[b]);
+
+    while (sym.size() > 1) {
+        int best_rank = INT_MAX;
+        size_t best_i = 0;
+        for (size_t i = 0; i + 1 < sym.size(); ++i) {
+            auto it = merge_ranks_.find(sym[i] + " " + sym[i + 1]);
+            if (it != merge_ranks_.end() && it->second < best_rank) { best_rank = it->second; best_i = i; }
+        }
+        if (best_rank == INT_MAX) break;
+        // Merge every occurrence of the best pair, left to right.
+        const std::string left = sym[best_i], right = sym[best_i + 1];
+        std::vector<std::string> merged;
+        merged.reserve(sym.size());
+        for (size_t i = 0; i < sym.size();) {
+            if (i + 1 < sym.size() && sym[i] == left && sym[i + 1] == right) { merged.push_back(left + right); i += 2; }
+            else merged.push_back(sym[i++]);
+        }
+        sym.swap(merged);
+    }
+    for (const auto& s : sym) {
+        auto it = token_to_id_.find(s);
+        if (it != token_to_id_.end()) out.push_back(it->second);
+        else if (unk_token_id_ >= 0) out.push_back(unk_token_id_);
+    }
+}
+
+// Legacy encoder kept for configs without merges (greedy longest match, only
+// space/newline/tab mapped to the byte alphabet).
+void Tokenizer::encodeGreedyLegacy(const std::string& segment, std::vector<int>& out) const {
+    std::string mapped;
+    for (char c : segment) {
+        if (c == ' ') mapped += "\xc4\xa0";
+        else if (c == '\n') mapped += "\xc4\x8a";
+        else if (c == '\t') mapped += "\xc4\x89";
+        else mapped += c;
+    }
+    size_t i = 0;
+    while (i < mapped.size()) {
+        size_t best_len = 0;
+        int best_id = unk_token_id_;
+        const size_t max_look = std::min((size_t)64, mapped.size() - i);
+        for (size_t j = 1; j <= max_look; ++j) {
+            auto it = token_to_id_.find(mapped.substr(i, j));
+            if (it != token_to_id_.end()) { best_len = j; best_id = it->second; }
+        }
+        out.push_back(best_id);
+        i += best_len ? best_len : 1;
+    }
+}
+
 std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<int> tokens;
     size_t i = 0;
-
-    const std::string IM_START_STR = "<|im_start|>";
-    const std::string IM_END_STR   = "<|im_end|>";
-    const std::string ENDOFTEXT_STR= "<|endoftext|>";
-
-    while (i < text.length()) {
-        // 1. Check for Qwen special tokens first
-        if (text.compare(i, IM_START_STR.length(), IM_START_STR) == 0) {
-            tokens.push_back(IM_START_ID);
-            i += IM_START_STR.length();
-            continue;
+    while (i < text.size()) {
+        // Find the earliest special token at or after i (longest wins on ties).
+        size_t next = text.size();
+        const std::pair<std::string, int>* hit = nullptr;
+        for (const auto& s : special_tokens_) {
+            const size_t p = text.find(s.first, i);
+            if (p != std::string::npos && p < next) { next = p; hit = &s; }
         }
-        if (text.compare(i, IM_END_STR.length(), IM_END_STR) == 0) {
-            tokens.push_back(IM_END_ID);
-            i += IM_END_STR.length();
-            continue;
+        if (next > i) {
+            const std::string segment = text.substr(i, next - i);
+            if (merge_ranks_.empty()) encodeGreedyLegacy(segment, tokens);
+            else for (const auto& piece : preTokenize(segment)) encodeBpe(piece, tokens);
         }
-        if (text.compare(i, ENDOFTEXT_STR.length(), ENDOFTEXT_STR) == 0) {
-            tokens.push_back(151643);
-            i += ENDOFTEXT_STR.length();
-            continue;
-        }
-
-        // Find next special token to segment normal text
-        size_t next_special = text.length();
-        size_t p_start = text.find(IM_START_STR, i);
-        size_t p_end   = text.find(IM_END_STR, i);
-        size_t p_eot   = text.find(ENDOFTEXT_STR, i);
-        if (p_start != std::string::npos && p_start < next_special) next_special = p_start;
-        if (p_end != std::string::npos && p_end < next_special) next_special = p_end;
-        if (p_eot != std::string::npos && p_eot < next_special) next_special = p_eot;
-
-        // Substring to encode
-        std::string segment = text.substr(i, next_special - i);
-        i = next_special;
-
-        // Map whitespace to BPE unicode characters
-        // ' ' -> \xc4\xa0 (Ġ)
-        // '\n' -> \xc4\x8a (Ċ)
-        // '\t' -> \xc4\x89 (ĉ)
-        std::string mapped_segment;
-        for (char c : segment) {
-            if (c == ' ') {
-                mapped_segment += "\xc4\xa0";
-            } else if (c == '\n') {
-                mapped_segment += "\xc4\x8a";
-            } else if (c == '\t') {
-                mapped_segment += "\xc4\x89";
-            } else {
-                mapped_segment += c;
-            }
-        }
-
-        // Greedy longest match on mapped segment
-        size_t seg_i = 0;
-        while (seg_i < mapped_segment.length()) {
-            size_t longest_match_len = 0;
-            int longest_match_id = unk_token_id_;
-            size_t max_look = std::min((size_t)64, mapped_segment.length() - seg_i);
-
-            for (size_t j = 1; j <= max_look; ++j) {
-                std::string sub = mapped_segment.substr(seg_i, j);
-                auto it = token_to_id_.find(sub);
-                if (it != token_to_id_.end()) {
-                    if (j > longest_match_len) {
-                        longest_match_len = j;
-                        longest_match_id = it->second;
-                    }
-                }
-            }
-
-            if (longest_match_len > 0) {
-                tokens.push_back(longest_match_id);
-                seg_i += longest_match_len;
-            } else {
-                tokens.push_back(unk_token_id_);
-                seg_i++;
-            }
-        }
+        if (hit) { tokens.push_back(hit->second); i = next + hit->first.size(); }
+        else i = next;
     }
     return tokens;
 }
 
 std::string Tokenizer::decode(const std::vector<int>& tokens) const {
-    std::stringstream ss;
-    for (int token_id : tokens) {
-        if (id_to_token_.count(token_id)) {
-            ss << id_to_token_.at(token_id);
-        } else {
-            // Handle unknown token IDs during decoding, e.g., print a placeholder
-            ss << "[UNK]";
-            std::cerr << "Warning: Unknown token ID encountered during decoding: " << token_id << std::endl;
+    std::string out;
+    for (int id : tokens) {
+        auto it = id_to_token_.find(id);
+        if (it == id_to_token_.end()) {
+            out += "[UNK]";
+            std::cerr << "Warning: Unknown token ID encountered during decoding: " << id << std::endl;
+            continue;
+        }
+        if (special_ids_.count(id)) { out += it->second; continue; }
+        for (const auto& c : decodeUtf8(it->second)) {
+            const std::string ch = it->second.substr(c.offset, c.len);
+            auto b = byte_decoder_.find(ch);
+            if (b != byte_decoder_.end()) out += (char)b->second;
+            else out += ch;
         }
     }
-    return ss.str();
+    return out;
 }
 
 std::string Tokenizer::applyChatTemplate(const std::string& prompt) const {

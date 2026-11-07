@@ -1,35 +1,31 @@
 #ifndef FRIDAY_TOKENIZER_H
 #define FRIDAY_TOKENIZER_H
 
-#include <string>
-#include <vector>
 #include <map>
-#include <fstream>
-#include <iostream>
-#include <algorithm> // For std::remove_if
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
+// Byte-level BPE tokenizer (GPT-2 / Qwen2 style).
+//
+// encode(): split on special tokens (<|...|>), pre-tokenize with the Qwen2
+// pattern, map bytes to the GPT-2 byte alphabet, then apply merges by rank.
+// Configs without "merges" fall back to the legacy greedy longest-match
+// encoder (with a warning); that path does not match the reference tokenizer.
+// Not implemented: Unicode NFC normalization of the input (input is assumed
+// to be NFC already).
 class Tokenizer {
 public:
-    // Constructor: Loads vocabulary from a tokenizer configuration file.
     explicit Tokenizer(const std::string& config_path);
 
-    // Encodes a given text string into a vector of token IDs.
     std::vector<int> encode(const std::string& text) const;
-
-    // Decodes a vector of token IDs back into a human-readable string.
     std::string decode(const std::vector<int>& tokens) const;
 
-private:
-    std::map<int, std::string> id_to_token_;     // Maps token IDs to their string representations.
-    std::map<std::string, int> token_to_id_;     // Maps string tokens to their integer IDs.
-    int unk_token_id_ = -1;                     // ID for unknown tokens.
-    int eos_token_id_ = -1;                     // ID for end-of-sequence token.
-
-public:
-    // Public getters for tokenizer info
-    int getVocabSize() const { return id_to_token_.size(); }
+    int getVocabSize() const { return (int)id_to_token_.size(); }
     int getUnkTokenId() const { return unk_token_id_; }
     int getEosTokenId() const { return eos_token_id_; }
+    bool hasMerges() const { return !merge_ranks_.empty(); }
 
     // Qwen special token IDs
     static constexpr int IM_START_ID = 151644;
@@ -38,13 +34,24 @@ public:
     // Applies Qwen ChatML template around the user's raw prompt
     std::string applyChatTemplate(const std::string& prompt) const;
 
-    // Helper function to parse a simple JSON-like configuration file.
-    // This is a minimal parser, not robust for complex JSON.
+    // Qwen2 pre-tokenizer: splits UTF-8 text into pre-tokens (exposed for tests).
+    static std::vector<std::string> preTokenize(const std::string& text);
+
     void parseConfigFile(const std::string& config_path);
 
-    // Helper to extract key and value from a JSON-like line (e.g., \"\"key\": value,\" or \"\"key\": \"value\",\")
-    bool extractKeyValue(const std::string& line, std::string& key, std::string& value);
+private:
+    void encodeBpe(const std::string& piece, std::vector<int>& out) const;
+    void encodeGreedyLegacy(const std::string& segment, std::vector<int>& out) const;
+
+    std::map<int, std::string> id_to_token_;
+    std::map<std::string, int> token_to_id_;
+    std::unordered_map<std::string, int> merge_ranks_;          // "left right" -> rank
+    std::vector<std::pair<std::string, int>> special_tokens_;   // longest first
+    std::unordered_set<int> special_ids_;
+    std::string byte_encoder_[256];
+    std::unordered_map<std::string, unsigned char> byte_decoder_;
+    int unk_token_id_ = -1;
+    int eos_token_id_ = -1;
 };
 
 #endif // FRIDAY_TOKENIZER_H
-

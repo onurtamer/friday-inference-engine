@@ -183,7 +183,7 @@ ctest --test-dir build -C Release -L unit    # CPU only, < 10 s
 ctest --test-dir build -C Release -L gpu     # GPU kernels vs. gguf reference (needs Python gguf + numpy)
 ctest --test-dir build -C Release -L model   # end-to-end regression snapshot, ~1 min
 ```
-Tests labelled `known-failing` document open defects (for example, the tokenizer does not yet apply BPE merges) and are expected to fail until fixed.
+Tests labelled `known-failing` document open defects and are expected to fail until fixed. The `model` label also includes a CPU-only tokenizer test against reference Qwen2 token ids; it needs a `tokenizer_config.json` with BPE merges (written by `converter.py` or `tools/export_tokenizer.py`).
 
 ---
 

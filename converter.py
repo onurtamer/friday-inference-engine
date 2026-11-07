@@ -89,32 +89,17 @@ def convert_gguf_to_aligned_bin(
 
     # 2. Tokenizer Bilgisini Cikar
     print("\n[2/4] Tokenizer sozlugu kontrol ediliyor...")
-    tokens_field = reader.fields.get("tokenizer.ggml.tokens")
-    if tokens_field:
-        try:
-            tokens_list = tokens_field.parts
-            id_to_token = {}
-            token_to_id = {}
-            for idx, part in enumerate(tokens_list):
-                token_bytes = bytes(part)
-                token_str = token_bytes.decode('utf-8', errors='replace')
-                id_to_token[str(idx)] = token_str
-                token_to_id[token_str] = idx
-
-            model_params["vocab_size"] = len(tokens_list)
-            tokenizer_data = {
-                "vocab_size": len(tokens_list),
-                "bos_token_id": 151644,
-                "eos_token_id": 151645,
-                "unk_token_id": 151643,
-                "id_to_token": id_to_token,
-                "token_to_id": token_to_id
-            }
-            with open(output_tokenizer_path, "w", encoding="utf-8") as f:
-                json.dump(tokenizer_data, f, ensure_ascii=False)
-            print(f"  Tokenizer sozlugu ({len(tokens_list)} token) '{output_tokenizer_path}' dosyasina yazildi.")
-        except Exception as e:
-            print(f"  [Uyari] Tokenizer cikarilirken hata: {e}, mevcut config korunacak.")
+    # Reads string arrays via field.data indices (field.parts also holds
+    # length/type headers, which previously shifted every token id).
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+        from gguf_tokenizer import write_tokenizer_config
+        tok = write_tokenizer_config(reader, output_tokenizer_path)
+        model_params["vocab_size"] = tok["vocab_size"]
+        print(f"  Tokenizer ({tok['vocab_size']} token, {len(tok['merges'])} merge, "
+              f"{len(tok['special_tokens'])} special) '{output_tokenizer_path}' dosyasina yazildi.")
+    except Exception as e:
+        print(f"  [Uyari] Tokenizer cikarilirken hata: {e}, mevcut config korunacak.")
 
     with open(output_params_path, "w", encoding="utf-8") as f:
         json.dump(model_params, f, indent=2)

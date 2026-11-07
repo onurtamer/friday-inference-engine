@@ -1,0 +1,259 @@
+[
+ {
+  "text": "Hello world",
+  "pieces": [
+   "Hello",
+   " world"
+  ]
+ },
+ {
+  "text": "I'm sure they'LL say it's fine, don't you THINK?",
+  "pieces": [
+   "I",
+   "'m",
+   " sure",
+   " they",
+   "'LL",
+   " say",
+   " it",
+   "'s",
+   " fine",
+   ",",
+   " don",
+   "'t",
+   " you",
+   " THINK",
+   "?"
+  ]
+ },
+ {
+  "text": "Çok güzel bir gün, değil mi? İstanbul'da yağmur var.",
+  "pieces": [
+   "Çok",
+   " güzel",
+   " bir",
+   " gün",
+   ",",
+   " değil",
+   " mi",
+   "?",
+   " İstanbul",
+   "'d",
+   "a",
+   " yağmur",
+   " var",
+   "."
+  ]
+ },
+ {
+  "text": "C++ dilinde RAII prensibini ve neden onemli oldugunu kisaca acikla.",
+  "pieces": [
+   "C",
+   "++",
+   " dilinde",
+   " RAII",
+   " prensibini",
+   " ve",
+   " neden",
+   " onemli",
+   " oldugunu",
+   " kisaca",
+   " acikla",
+   "."
+  ]
+ },
+ {
+  "text": "12345 + 3.14159 = 12348.14159; 1,000,000",
+  "pieces": [
+   "1",
+   "2",
+   "3",
+   "4",
+   "5",
+   " +",
+   " ",
+   "3",
+   ".",
+   "1",
+   "4",
+   "1",
+   "5",
+   "9",
+   " =",
+   " ",
+   "1",
+   "2",
+   "3",
+   "4",
+   "8",
+   ".",
+   "1",
+   "4",
+   "1",
+   "5",
+   "9",
+   ";",
+   " ",
+   "1",
+   ",",
+   "0",
+   "0",
+   "0",
+   ",",
+   "0",
+   "0",
+   "0"
+  ]
+ },
+ {
+  "text": "for (int i = 0; i < n; ++i) {\n\treturn x * 2;\n}",
+  "pieces": [
+   "for",
+   " (",
+   "int",
+   " i",
+   " =",
+   " ",
+   "0",
+   ";",
+   " i",
+   " <",
+   " n",
+   ";",
+   " ++",
+   "i",
+   ")",
+   " {\n",
+   "\treturn",
+   " x",
+   " *",
+   " ",
+   "2",
+   ";\n",
+   "}"
+  ]
+ },
+ {
+  "text": "  leading spaces",
+  "pieces": [
+   " ",
+   " leading",
+   " spaces"
+  ]
+ },
+ {
+  "text": "trailing spaces   ",
+  "pieces": [
+   "trailing",
+   " spaces",
+   "   "
+  ]
+ },
+ {
+  "text": "a\n\n\nb",
+  "pieces": [
+   "a",
+   "\n\n\n",
+   "b"
+  ]
+ },
+ {
+  "text": "line1\r\nline2\r\n",
+  "pieces": [
+   "line",
+   "1",
+   "\r\n",
+   "line",
+   "2",
+   "\r\n"
+  ]
+ },
+ {
+  "text": "tabs\t\tand   multiple    spaces",
+  "pieces": [
+   "tabs",
+   "\t",
+   "\tand",
+   "  ",
+   " multiple",
+   "   ",
+   " spaces"
+  ]
+ },
+ {
+  "text": "emoji 🙂👍🏽 test",
+  "pieces": [
+   "emoji",
+   " 🙂👍🏽",
+   " test"
+  ]
+ },
+ {
+  "text": "你好，世界！こんにちは 세계",
+  "pieces": [
+   "你好",
+   "，世界",
+   "！こんにちは",
+   " 세계"
+  ]
+ },
+ {
+  "text": "مرحبا بالعالم",
+  "pieces": [
+   "مرحبا",
+   " بالعالم"
+  ]
+ },
+ {
+  "text": "!!!???...---***",
+  "pieces": [
+   "!!!???...---***"
+  ]
+ },
+ {
+  "text": "e-mail: user@example.com, url: https://example.com/a?b=c",
+  "pieces": [
+   "e",
+   "-mail",
+   ":",
+   " user",
+   "@example",
+   ".com",
+   ",",
+   " url",
+   ":",
+   " https",
+   "://",
+   "example",
+   ".com",
+   "/a",
+   "?b",
+   "=c"
+  ]
+ },
+ {
+  "text": "x²+y³ ½ ⅓ Ⅻ",
+  "pieces": [
+   "x",
+   "²",
+   "+y",
+   "³",
+   " ",
+   "½",
+   " ",
+   "⅓",
+   " ",
+   "Ⅻ"
+  ]
+ },
+ {
+  "text": "'s 'sun ' alone",
+  "pieces": [
+   "'s",
+   " '",
+   "sun",
+   " '",
+   " alone"
+  ]
+ }
+]

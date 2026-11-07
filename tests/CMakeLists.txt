@@ -17,9 +17,12 @@ endfunction()
 friday_test_target(test_tokenizer_bpe unit/test_tokenizer_bpe.cpp)
 add_test(NAME tokenizer_bpe
          COMMAND test_tokenizer_bpe ${CMAKE_CURRENT_BINARY_DIR}/tokenizer_bpe_fixture.json)
-# KNOWN FAILING: the tokenizer does not apply BPE merges yet (roadmap R1).
-# WILL_FAIL keeps the suite green while the defect stays visible; remove it with the fix.
-set_tests_properties(tokenizer_bpe PROPERTIES LABELS "unit;known-failing" WILL_FAIL TRUE)
+set_tests_properties(tokenizer_bpe PROPERTIES LABELS "unit")
+
+friday_test_target(test_tokenizer_pretokenize unit/test_tokenizer_pretokenize.cpp)
+add_test(NAME tokenizer_pretokenize
+         COMMAND test_tokenizer_pretokenize ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/pretokenize_reference.json)
+set_tests_properties(tokenizer_pretokenize PROPERTIES LABELS "unit")
 
 # --- gpu --------------------------------------------------------------------
 find_package(Python3 COMPONENTS Interpreter)
@@ -49,7 +52,13 @@ endif()
 set(FRIDAY_MODEL_DIR "" CACHE PATH
     "Directory with friday_aligned_int4.bin, tensor_map.json, tokenizer_config.json (enables model tests)")
 friday_test_target(golden_check model/golden_check.cpp)
+friday_test_target(test_tokenizer_qwen model/test_tokenizer_qwen.cpp)
 if(FRIDAY_MODEL_DIR)
+    # CPU only: engine tokenizer vs. reference Qwen2 tokenizer ids.
+    add_test(NAME tokenizer_qwen_reference
+             COMMAND test_tokenizer_qwen ${FRIDAY_MODEL_DIR}/tokenizer_config.json
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/qwen2_encode_reference.json)
+    set_tests_properties(tokenizer_qwen_reference PROPERTIES LABELS "model")
     add_test(NAME model_regression_qwen25_32b_q2k
              COMMAND golden_check
                      ${FRIDAY_MODEL_DIR}/friday_aligned_int4.bin
