@@ -38,6 +38,9 @@ recorded, docs updated, commit reviewed.
     thread-per-row, uncoalesced) → 2.42 tok/s decode, 2.78 tok/s prefill.
     Remaining per-token cost: CPU attention + copies ~190 ms, MLP GEMV ~171 ms
     (~16% of memory bandwidth), PCIe streaming ~42 ms.
+  - Step 2 (2026-11-08): GPU decode attention + fp16 KV cache on the GPU
+    (`--ctx`, default 2048 = 512 MiB) → 3.44 tok/s decode, 3.52 tok/s prefill
+    (median of 3; 52/64 layers on GPU). Golden v2 unchanged (32/32, max 0.28).
 
 ## v1.0 — public local inference engine
 
@@ -48,7 +51,7 @@ recorded, docs updated, commit reviewed.
 | R2 | Model loading | Direct GGUF parsing (no tensor_map/convert step); model registry with hash, license, architecture; Qwen2.5/3 + Llama/Mistral |
 | R3 | Backend + platform HAL (Windows and Linux) | Backend interface; CUDA backend from existing kernels; CPU backend (AVX2 + NEON); capability report; ARM cross-compile + QEMU tests |
 | R4 | Measured optimizations | Profile first; GPU attention/KV (currently CPU), non-blocking streams, bandwidth-efficient GEMV, CUDA Graphs and kernel fusion, batched prefill, kernel-bypass memory/IO; decode ≥60% of the computed ceiling; per-platform before/after tok/s and numerical diff |
-| R5 | Benchmarks & performance model | Measured table (RTX 3060, Ryzen 5600X); estimate table for other GPUs/ARM boards; published methodology |
+| R5 | Benchmarks & performance model | Controlled benchmark tool (N repeats, median/p95, records free RAM, GPU clocks and background load); measured table (RTX 3060, Ryzen 5600X); estimate table for other GPUs/ARM boards; published methodology |
 | R6 | Chat & persistent memory | Per-model chat templates; sessions; SQLite + FTS memory with provenance, edit and delete |
 | R7 | API server & router | OpenAI-compatible HTTP, SSE streaming, cancel, queue, multi-model routing; localhost default, token auth |
 | R8 | Stability & release | Multi-hour soak; fuzzing (GGUF parser, API); structured logs/metrics; semantic versioning; GitHub release |

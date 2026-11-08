@@ -55,10 +55,13 @@ public:
         float model_rms_norm_epsilon,
         QuantType model_quant_type,
         AsyncIOManager* async_io_manager_ptr,
-        double vram_limit_gb = 0.0
+        double vram_limit_gb = 0.0,
+        int max_context = 2048
     );
 
     ~Transformer();
+
+    int getMaxContext() const { return max_ctx_; }
 
     // RMSNorm (weights are float32 in GGUF)
     void applyRMSNorm(half* d_input, const float* d_weight, half* d_output, int size, cudaStream_t stream);
@@ -127,9 +130,12 @@ private:
 
     AsyncIOManager* async_io_manager_ptr_;
 
-    // KV-Cache storage (Host tarafında)
-    std::vector<std::vector<std::vector<half>>> k_cache_;
-    std::vector<std::vector<std::vector<half>>> v_cache_;
+    // KV cache on the GPU, fp16, layout [layer][max_ctx][num_kv_heads * head_dim]
+    // for K and V. Allocated once in the constructor (counted in the VRAM budget).
+    int max_ctx_ = 2048;
+    half* d_k_cache_ = nullptr;
+    half* d_v_cache_ = nullptr;
+    half* d_attn_ctx_ = nullptr;  // attention output, input of the O projection
 
     // ============================================================
     // V32: Esnek Hibrit Bellek (Elastic Tiered Memory)
@@ -156,10 +162,6 @@ private:
     // Ping-Pong Asenkron Akışları
     cudaStream_t stream_compute_ = nullptr; // Stream 1: GPU Hesaplama
     cudaStream_t stream_io_ = nullptr;      // Stream 2: NVMe/PCIe Prefetch
-
-    // KV Cache VRAM Rezerv Havuzu (4-5 GB VRAM Kilidi)
-    void* d_kv_cache_pool_ = nullptr;
-    size_t kv_pool_size_bytes_ = 0;
 
     // Katman dışı statik tensörler (Emb & LM Head)
     unsigned char* d_token_embd_ = nullptr;

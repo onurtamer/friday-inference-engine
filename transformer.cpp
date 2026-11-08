@@ -1,4 +1,5 @@
 #include "transformer.h"
+#include "attention_kernels.h"
 #include <stdexcept>
 #include "io_manager.h"
 #include "kernel_dispatcher.h"
@@ -102,7 +103,8 @@ Transformer::Transformer(
     float model_rms_norm_epsilon,
     QuantType model_quant_type,
     AsyncIOManager* async_io_manager_ptr,
-    double vram_limit_gb
+    double vram_limit_gb,
+    int max_context
 )
     : model_file_path_(model_file_path),
       hidden_dim_(model_hidden_dim),
@@ -113,8 +115,10 @@ Transformer::Transformer(
       rms_norm_epsilon_(model_rms_norm_epsilon),
       model_quant_type_(model_quant_type),
       async_io_manager_ptr_(async_io_manager_ptr),
-      vram_limit_gb_(vram_limit_gb)
+      vram_limit_gb_(vram_limit_gb),
+      max_ctx_(max_context)
 {
+    if (max_ctx_ <= 0) throw std::runtime_error("max_context must be positive");
     if (hidden_dim_ % num_heads_ != 0) {
         fprintf(stderr, "Error: hidden_dim (%d) must be divisible by num_heads (%d).\n", hidden_dim_, num_heads_);
         exit(EXIT_FAILURE);
@@ -123,10 +127,6 @@ Transformer::Transformer(
            hidden_dim_, num_heads_, num_kv_heads_, num_layers_, rms_norm_epsilon_, model_quant_type_);
 
     loadTensorMap(tensor_map_path);
-
-    // Initialize KV Cache sizes per layer
-    k_cache_.resize(num_layers_);
-    v_cache_.resize(num_layers_);
 
     // Determine max intermediate size for MLP
     for (const auto& item : full_tensor_map_) {
@@ -156,6 +156,17 @@ Transformer::Transformer(
     CUDA_CHECK(cudaMemset(d_norm_output_, 0, hidden_dim_ * sizeof(half)));
     CUDA_CHECK(cudaMemset(d_gate_out_, 0, max_intermediate_size_ * sizeof(half)));
     CUDA_CHECK(cudaMemset(d_up_out_, 0, max_intermediate_size_ * sizeof(half)));
+
+    // KV cache on the GPU. Allocated before the residency planner measures free
+    // VRAM, so it is part of the deterministic budget.
+    {
+        const size_t kv_elems = (size_t)num_layers_ * max_ctx_ * num_kv_heads_ * head_dim_;
+        CUDA_CHECK(cudaMalloc((void**)&d_k_cache_, kv_elems * sizeof(half)));
+        CUDA_CHECK(cudaMalloc((void**)&d_v_cache_, kv_elems * sizeof(half)));
+        CUDA_CHECK(cudaMalloc((void**)&d_attn_ctx_, hidden_dim_ * sizeof(half)));
+        printf("[Transformer] GPU KV cache: max context %d, %.0f MiB (K + V)\n", max_ctx_,
+               (double)(2 * kv_elems * sizeof(half)) / (1024.0 * 1024.0));
+    }
 
     // =========================================================================
     // Katman Disi Statik Tensorleri Yukle (Token Embedding, Output Norm, LM Head)
@@ -343,6 +354,9 @@ Transformer::~Transformer() {
     if (d_token_embd_) CUDA_CHECK(cudaFree(d_token_embd_));
     if (d_output_norm_) CUDA_CHECK(cudaFree(d_output_norm_));
     if (d_lm_head_) CUDA_CHECK(cudaFree(d_lm_head_));
+    if (d_k_cache_) CUDA_CHECK(cudaFree(d_k_cache_));
+    if (d_v_cache_) CUDA_CHECK(cudaFree(d_v_cache_));
+    if (d_attn_ctx_) CUDA_CHECK(cudaFree(d_attn_ctx_));
     
     if (stream_compute_) CUDA_CHECK(cudaStreamDestroy(stream_compute_));
     if (stream_io_) CUDA_CHECK(cudaStreamDestroy(stream_io_));
@@ -566,88 +580,31 @@ void Transformer::applySelfAttention(
     // 4. RoPE
     applyRoPE(d_query_out, d_key_out, head_dim_, seq_len, pos_offset, stream);
 
-    // 5. KV-Cache ve Attention Hesaplamasi
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    int kv_dim = num_kv_heads_ * head_dim_;
-
-    std::vector<half> h_query(hidden_dim_);
-    std::vector<half> h_key(kv_dim);
-    std::vector<half> h_value(kv_dim);
-    std::vector<half> h_attention_output(hidden_dim_, __float2half(0.0f));
-
-    CUDA_CHECK(cudaMemcpy(h_query.data(), d_query_out, hidden_dim_ * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_key.data(), d_key_out, kv_dim * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_value.data(), d_value_out, kv_dim * sizeof(half), cudaMemcpyDeviceToHost));
-
-    if (pos_offset == 0) {
-        k_cache_[layer_idx].clear();
-        v_cache_[layer_idx].clear();
+    // Attention on the GPU: append K/V for this position to the layer's KV cache,
+    // then single-query GQA attention over positions 0..pos_offset. No host copies
+    // or stream synchronization.
+    if (seq_len != 1) {
+        throw std::runtime_error("applySelfAttention: only single-token decode is supported");
     }
-
-    k_cache_[layer_idx].push_back(h_key);
-    v_cache_[layer_idx].push_back(h_value);
-
-    int current_seq_len = (int)k_cache_[layer_idx].size();
-    float scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-    int heads_per_kv = num_heads_ / num_kv_heads_;
-
-    for (int h_q = 0; h_q < num_heads_; ++h_q) {
-        int h_kv = h_q / heads_per_kv;
-        int q_offset = h_q * head_dim_;
-        int kv_offset = h_kv * head_dim_;
-
-        std::vector<float> scores(current_seq_len);
-        float max_score = -1e30f;
-
-        // Step 1: FP32 Dot-product Q * K^T with scale
-        for (int p = 0; p < current_seq_len; ++p) {
-            float score = 0.0f;
-            const auto& past_k = k_cache_[layer_idx][p];
-            for (int d = 0; d < head_dim_; ++d) {
-                float q_val = __half2float(h_query[q_offset + d]);
-                float k_val = __half2float(past_k[kv_offset + d]);
-                score += q_val * k_val;
-            }
-            score *= scale;
-            if (std::isnan(score)) score = -1e30f;
-            scores[p] = score;
-            if (score > max_score) max_score = score;
-        }
-
-        // Step 2: SAFE SOFTMAX TRICK (FP32)
-        float sum_exp = 0.0f;
-        for (int p = 0; p < current_seq_len; ++p) {
-            float diff = scores[p] - max_score;
-            float exp_val = (diff < -50.0f) ? 0.0f : expf(diff);
-            scores[p] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum_exp = (sum_exp > 1e-12f) ? (1.0f / sum_exp) : 0.0f;
-
-        // Step 3: FP32 Score * V accumulation with FP16 range clamping
-        for (int d = 0; d < head_dim_; ++d) {
-            float out_val = 0.0f;
-            for (int p = 0; p < current_seq_len; ++p) {
-                float weight = scores[p] * inv_sum_exp;
-                const auto& past_v = v_cache_[layer_idx][p];
-                float v_val = __half2float(past_v[kv_offset + d]);
-                out_val += weight * v_val;
-            }
-            if (std::isnan(out_val)) out_val = 0.0f;
-            else if (out_val > 65504.0f) out_val = 65504.0f;
-            else if (out_val < -65504.0f) out_val = -65504.0f;
-            h_attention_output[q_offset + d] = __float2half(out_val);
-        }
+    if (pos_offset < 0 || pos_offset >= max_ctx_) {
+        throw std::runtime_error("context length exceeded: position " + std::to_string(pos_offset) +
+                                 " >= max context " + std::to_string(max_ctx_));
     }
-
-    CUDA_CHECK(cudaMemcpy(d_query_out, h_attention_output.data(), hidden_dim_ * sizeof(half), cudaMemcpyHostToDevice));
+    const int kv_dim = num_kv_heads_ * head_dim_;
+    half* k_layer = d_k_cache_ + (size_t)layer_idx * max_ctx_ * kv_dim;
+    half* v_layer = d_v_cache_ + (size_t)layer_idx * max_ctx_ * kv_dim;
+    CUDA_CHECK(cudaMemcpyAsync(k_layer + (size_t)pos_offset * kv_dim, d_key_out, kv_dim * sizeof(half),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(v_layer + (size_t)pos_offset * kv_dim, d_value_out, kv_dim * sizeof(half),
+                               cudaMemcpyDeviceToDevice, stream));
+    friday_attn::launchDecodeAttention(d_query_out, k_layer, v_layer, d_attn_ctx_, pos_offset + 1,
+                                       num_heads_, num_kv_heads_, head_dim_, stream);
+    CUDA_CHECK(cudaGetLastError());
 
     // Output Projeksiyonu
     FridayKernelDispatcher::dispatchGemvKernel(
         getQuantTypeFromDtype(o_info.dtype),
-        d_query_out,
+        d_attn_ctx_,
         d_Wo_ptr,
         nullptr,
         nullptr,

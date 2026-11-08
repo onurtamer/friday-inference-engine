@@ -27,6 +27,7 @@ set(FRIDAY_ENGINE_SOURCES
     int4_kernel.cu
     kernel_dispatcher.cpp
     hpc_k_quants.cu
+    attention_kernels.cu
 )
 set_source_files_properties(${FRIDAY_ENGINE_SOURCES} main.cpp PROPERTIES LANGUAGE CUDA)
 

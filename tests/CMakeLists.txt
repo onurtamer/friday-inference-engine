@@ -25,6 +25,10 @@ add_test(NAME tokenizer_pretokenize
 set_tests_properties(tokenizer_pretokenize PROPERTIES LABELS "unit")
 
 # --- gpu --------------------------------------------------------------------
+friday_test_target(test_decode_attention kernels/test_decode_attention.cu)
+add_test(NAME decode_attention COMMAND test_decode_attention)
+set_tests_properties(decode_attention PROPERTIES LABELS "gpu")
+
 find_package(Python3 COMPONENTS Interpreter)
 set(FRIDAY_HAVE_GGUF_PY FALSE)
 if(Python3_Interpreter_FOUND)

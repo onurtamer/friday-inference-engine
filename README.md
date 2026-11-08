@@ -192,6 +192,7 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | Option | Argument | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `--vram` | `<float>` | Maximum GPU VRAM to allocate for weights and buffers (in GB). | `0.0` (Auto-detect free VRAM) |
+| `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). Allocated on the GPU in fp16 (~256 KiB per token for Qwen2.5-32B). | `2048` |
 | `<model_path>`| `<string>` | Path to the 4KB sector-aligned binary model file. | `friday_aligned_int4.bin` |
 
 ---

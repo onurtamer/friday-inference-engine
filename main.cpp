@@ -130,11 +130,14 @@ int main(int argc, char** argv) {
         // Model yolu ve VRAM limiti kontrolü:
         std::string gguf_model_path = "friday_aligned_int4.bin";
         double vram_limit_gb = 0.0; // 0.0 = Otomatik algilama
+        int max_context = 2048;      // --ctx N: KV cache capacity in tokens (GPU memory)
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--vram" && i + 1 < argc) {
                 vram_limit_gb = std::stod(argv[++i]);
+            } else if (arg == "--ctx" && i + 1 < argc) {
+                max_context = std::stoi(argv[++i]);
             } else if (arg.rfind("--", 0) != 0) {
                 // Sayısal değer ise vram limiti, değilse model dosyasıdır
                 try {
@@ -201,7 +204,8 @@ int main(int argc, char** argv) {
             rms_norm_epsilon,
             model_quant_type,
             &async_io_manager,
-            vram_limit_gb
+            vram_limit_gb,
+            max_context
         );
 
         int vocab_size = transformer.getVocabSize();
