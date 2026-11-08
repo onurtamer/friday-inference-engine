@@ -54,8 +54,8 @@ ModelConfig ModelConfig::fromGguf(const GgufFile& f) {
 }
 
 void ModelConfig::checkSupported() const {
-    if (architecture != "qwen2" && architecture != "llama")
-        throw std::runtime_error("unsupported architecture '" + architecture + "' (supported: qwen2, llama)");
+    if (architecture != "qwen2" && architecture != "qwen3" && architecture != "llama")
+        throw std::runtime_error("unsupported architecture '" + architecture + "' (supported: qwen2, qwen3, llama)");
     if (head_dim != 128 || head_dim * num_heads != hidden_dim)
         throw std::runtime_error("unsupported head layout: head_dim " + std::to_string(head_dim) + " (need 128)");
     if (num_heads % num_kv_heads != 0) throw std::runtime_error("num_heads must be a multiple of num_kv_heads");

@@ -19,6 +19,7 @@
 
 // --- CUDA Kernel Declarations ---
 __global__ void rmsNormKernel(half* d_input, const float* d_weight, half* d_output, int size, float epsilon);
+__global__ void headRmsNormKernel(half* d_x, const float* d_weight, int head_dim, float epsilon);
 __global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, int num_q_heads,
                            int num_kv_heads, float freq_base, int neox, const float* freq_factors);
 __global__ void geluKernel(half* d_activations, int size);
@@ -791,6 +792,19 @@ void Transformer::applySelfAttention(
     }
     CUDA_CHECK(cudaGetLastError());
 
+    // Qwen3: per-head RMSNorm of Q and K before RoPE (attn_q_norm / attn_k_norm).
+    {
+        const std::string qn = "blk." + std::to_string(layer_idx) + ".attn_q_norm.weight";
+        const std::string kn = "blk." + std::to_string(layer_idx) + ".attn_k_norm.weight";
+        if (l_info.tensor_rel_offsets.count(qn) && l_info.tensor_rel_offsets.count(kn)) {
+            const float* wq = (const float*)(d_layer_buf + l_info.tensor_rel_offsets.at(qn));
+            const float* wk = (const float*)(d_layer_buf + l_info.tensor_rel_offsets.at(kn));
+            headRmsNormKernel<<<num_heads_, head_dim_, head_dim_ * sizeof(float), stream>>>(d_query_out, wq, head_dim_, rms_norm_epsilon_);
+            headRmsNormKernel<<<num_kv_heads_, head_dim_, head_dim_ * sizeof(float), stream>>>(d_key_out, wk, head_dim_, rms_norm_epsilon_);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
     // 4. RoPE
     applyRoPE(d_query_out, d_key_out, head_dim_, seq_len, pos_offset, stream);
 
@@ -1234,6 +1248,20 @@ void Transformer::cpuLayer(int layer_idx, int pos) {
     addBias("attn_q.bias", cpu_q_.data(), gemv("attn_q.weight", xa, cpu_q_.data()));
     addBias("attn_k.bias", cpu_k_.data(), gemv("attn_k.weight", xa, cpu_k_.data()));
     addBias("attn_v.bias", cpu_v_.data(), gemv("attn_v.weight", xa, cpu_v_.data()));
+    if (li.tensor_rel_offsets.count(pre + "attn_q_norm.weight") && li.tensor_rel_offsets.count(pre + "attn_k_norm.weight")) {
+        // Qwen3: per-head RMSNorm of Q and K (same math as headRmsNormKernel).
+        const float* wq = reinterpret_cast<const float*>(ptr("attn_q_norm.weight"));
+        const float* wk = reinterpret_cast<const float*>(ptr("attn_k_norm.weight"));
+        std::vector<float> tmp(head_dim_);
+        for (int h = 0; h < num_heads_; ++h) {
+            rmsNorm(cpu_q_.data() + h * head_dim_, wq, tmp.data(), head_dim_, rms_norm_epsilon_);
+            std::memcpy(cpu_q_.data() + h * head_dim_, tmp.data(), head_dim_ * sizeof(float));
+        }
+        for (int h = 0; h < num_kv_heads_; ++h) {
+            rmsNorm(cpu_k_.data() + h * head_dim_, wk, tmp.data(), head_dim_, rms_norm_epsilon_);
+            std::memcpy(cpu_k_.data() + h * head_dim_, tmp.data(), head_dim_ * sizeof(float));
+        }
+    }
     rope(cpu_q_.data(), cpu_k_.data(), head_dim_, num_heads_, num_kv_heads_, pos, rope_freq_base_, rope_neox_,
          h_rope_freqs_.empty() ? nullptr : h_rope_freqs_.data());
     float* k_layer = cpu_k_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;

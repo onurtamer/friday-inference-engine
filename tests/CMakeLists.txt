@@ -103,6 +103,19 @@ if(FRIDAY_MODEL_DIR)
         set_tests_properties(model_regression_qwen25_32b_q2k PROPERTIES LABELS "model" TIMEOUT 600)
     endif()
 endif()
+set(FRIDAY_QWEN3_GGUF "" CACHE FILEPATH "Qwen3-8B-Q4_K_M.gguf (Qwen/Qwen3-8B-GGUF) for the Qwen3 model tests")
+if(FRIDAY_QWEN3_GGUF AND EXISTS ${FRIDAY_QWEN3_GGUF})
+    add_test(NAME tokenizer_qwen3_reference
+             COMMAND test_tokenizer_qwen ${FRIDAY_QWEN3_GGUF}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/qwen3_encode_reference.json)
+    set_tests_properties(tokenizer_qwen3_reference PROPERTIES LABELS "model")
+    add_test(NAME model_regression_qwen3_8b_q4km
+             COMMAND golden_check ${FRIDAY_QWEN3_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen3-8b-q4km - 12.0)
+    add_test(NAME model_regression_qwen3_8b_q4km_cpu
+             COMMAND golden_check ${FRIDAY_QWEN3_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen3-8b-q4km - 3.0)
+    set_tests_properties(model_regression_qwen3_8b_q4km model_regression_qwen3_8b_q4km_cpu
+                         PROPERTIES LABELS "model" TIMEOUT 600)
+endif()
 set(FRIDAY_LLAMA31_GGUF "" CACHE FILEPATH
     "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (bartowski) for the Llama 3.1 model tests")
 if(FRIDAY_LLAMA31_GGUF AND EXISTS ${FRIDAY_LLAMA31_GGUF})

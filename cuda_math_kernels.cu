@@ -252,6 +252,31 @@ void launchQ4_1GemvKernel(
 // Weight in GGUF is 32-bit float (F32).
 // Formula: output[i] = (input[i] / sqrt(mean(input^2) + epsilon)) * weight[i]
 // ============================================================
+// Per-head RMSNorm in place (Qwen3 attn_q_norm / attn_k_norm): one block per
+// head, blockDim.x == head_dim threads; weight [head_dim] shared by all heads.
+// Same rules as rmsNormKernel: fp32 sum of squares (NaN/Inf skipped), output
+// NaN -> 0 and clamped to the fp16 range.
+__global__ void headRmsNormKernel(half* d_x, const float* d_weight, int head_dim, float epsilon) {
+    extern __shared__ float red[];
+    half* v = d_x + (size_t)blockIdx.x * head_dim;
+    const int tid = threadIdx.x;
+    float val = __half2float(v[tid]);
+    if (isnan(val) || isinf(val)) val = 0.0f;
+    red[tid] = val * val;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    const float rms = sqrtf(red[0] / (float)head_dim + epsilon);
+    const float inv = (rms > 1e-12f) ? (1.0f / rms) : 1.0f;
+    float res = val * inv * d_weight[tid];
+    if (isnan(res)) res = 0.0f;
+    else if (res > 65504.0f) res = 65504.0f;
+    else if (res < -65504.0f) res = -65504.0f;
+    v[tid] = __float2half(res);
+}
+
 __global__ void rmsNormKernel(half* d_input, const float* d_weight, half* d_output, int size, float epsilon) {
     extern __shared__ float shared_data[];
 

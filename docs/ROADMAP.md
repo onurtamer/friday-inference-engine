@@ -36,7 +36,7 @@ recorded, docs updated, commit reviewed.
         GPU tests and on a 2-token model run (memcheck, racecheck; initcheck needs more host RAM than this 16 GB machine has with the 32B model); ASAN (MSVC) clean on unit/GPU tests and the full model golden test.
   - [x] Build warnings fixed (C4297, LNK4098, C4005); CMake sm_86 default was dead
         code (set after `project()`, everything built for sm_52) — fixed.
-- **R2 — in progress.**
+- **R2 — done (2026-11-08)** (Mistral deferred, see below).
   - [x] R2a: direct GGUF loading. Bounds-checked C++ GGUF reader (unit test vs.
         gguf-py, 9 malformed files rejected), hyper-parameters and tokenizer from
         metadata, per-tensor packed layer buffers (GGUF layers are not always
@@ -55,7 +55,10 @@ recorded, docs updated, commit reviewed.
         32/32, max top-1 diff 0.035. Golden check now uses teacher forcing on
         the reference tokens and reports reference near-ties (< 0.1 nats).
         Numerics: Q6_K now uses int8 activations; Qwen2.5 max diff 0.271 -> 0.278.
-  - [ ] R2c (rest): Qwen3 (q/k norm) and Mistral, each with a golden test.
+  - [x] R2c (Qwen3): per-head q/k RMSNorm (GPU kernel + CPU path). Tokenizer
+        20/20 vs. llama-tokenize; golden vs. llama.cpp for Qwen3-8B Q4_K_M
+        (all-GPU and 9 GPU / 27 CPU layers): 32/32, max top-1 diff 0.019.
+        Mistral (needs a SentencePiece tokenizer) moved to after R3 (2026-11-08).
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).
