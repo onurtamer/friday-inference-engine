@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
+#include "gguf_file.h"
 #include "unicode_tables.h"
 
 namespace {
@@ -183,6 +184,12 @@ void Tokenizer::parseConfigFile(const std::string& config_path) {
                 special_tokens_.push_back({t, p.second});
         }
     }
+    finishInit(config_path);
+}
+
+// Shared by the JSON and GGUF loaders: ordering of special tokens, the byte
+// alphabet, and fallbacks.
+void Tokenizer::finishInit(const std::string& source) {
     std::sort(special_tokens_.begin(), special_tokens_.end(),
               [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
     for (const auto& s : special_tokens_) special_ids_.insert(s.second);
@@ -204,12 +211,42 @@ void Tokenizer::parseConfigFile(const std::string& config_path) {
         std::cerr << "Warning: tokenizer config has no merges; using the legacy greedy encoder, "
                      "which does not match the reference tokenizer.\n";
     }
-    std::cout << "Tokenizer config loaded from " << config_path << ". Vocab size: " << id_to_token_.size()
+    std::cout << "Tokenizer loaded from " << source << ". Vocab size: " << id_to_token_.size()
               << ", merges: " << merge_ranks_.size() << ", special tokens: " << special_tokens_.size() << std::endl;
 }
 
 Tokenizer::Tokenizer(const std::string& config_path) {
     parseConfigFile(config_path);
+}
+
+// GGUF metadata: tokenizer.ggml.{tokens, merges, token_type, *_token_id}.
+// Control (3) and user-defined (4) tokens are matched as special tokens,
+// as in tools/gguf_tokenizer.py.
+Tokenizer::Tokenizer(const friday::GgufFile& gguf) {
+    const std::string model = gguf.getString("tokenizer.ggml.model", "");
+    if (model != "gpt2")
+        throw std::runtime_error("unsupported tokenizer model '" + model + "' (supported: gpt2 byte-level BPE)");
+    const std::string pre = gguf.getString("tokenizer.ggml.pre", "");
+    if (pre != "qwen2")
+        std::cerr << "Warning: tokenizer pre-type '" << pre << "' uses the Qwen2 pre-tokenizer, "
+                     "which may split text differently from the reference.\n";
+    const auto& tokens = gguf.getStringArray("tokenizer.ggml.tokens");
+    for (int i = 0; i < (int)tokens.size(); ++i) {
+        id_to_token_[i] = tokens[i];
+        token_to_id_.emplace(tokens[i], i);
+    }
+    if (gguf.has("tokenizer.ggml.merges")) {
+        int rank = 0;
+        for (const auto& m : gguf.getStringArray("tokenizer.ggml.merges")) merge_ranks_.emplace(m, rank++);
+    }
+    if (gguf.has("tokenizer.ggml.token_type")) {
+        const auto& types = gguf.getIntArray("tokenizer.ggml.token_type");
+        for (size_t i = 0; i < types.size() && i < tokens.size(); ++i)
+            if (types[i] == 3 || types[i] == 4) special_tokens_.push_back({tokens[i], (int)i});
+    }
+    if (gguf.has("tokenizer.ggml.eos_token_id")) eos_token_id_ = (int)gguf.getUInt("tokenizer.ggml.eos_token_id");
+    if (gguf.has("tokenizer.ggml.unknown_token_id")) unk_token_id_ = (int)gguf.getUInt("tokenizer.ggml.unknown_token_id");
+    finishInit(gguf.path() + " (GGUF)");
 }
 
 // ---------------------------------------------------------------------------

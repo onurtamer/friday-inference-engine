@@ -39,10 +39,15 @@ namespace friday_cpu { class ThreadPool; }
 enum QuantType; // kernel_dispatcher.h'den
 
 // Katman yapısını ve tensör bağıl ofsetlerini tutan yapı (Zero cudaMalloc mimarisi)
+struct LayerChunk {
+    size_t file_offset;   // absolute offset in the model file
+    size_t size;          // bytes
+    size_t rel_offset;    // offset inside the packed layer buffer
+};
 struct LayerInfo {
-    size_t start_offset = 0;
-    size_t size_bytes = 0;
-    std::map<std::string, size_t> tensor_rel_offsets;
+    size_t size_bytes = 0;                            // packed size
+    std::map<std::string, size_t> tensor_rel_offsets; // tensor name -> offset in the packed buffer
+    std::vector<LayerChunk> chunks;                   // file ranges to read, in file order
 };
 
 // Dequantize one embedding row (Q4_0, Q2_K, Q3_K, Q4_K, Q6_K or F16) on the GPU.
@@ -199,7 +204,10 @@ private:
     half *d_gate_out_ = nullptr, *d_up_out_ = nullptr;
     int max_intermediate_size_ = 0;
 
-    void loadTensorMap(const std::string& map_path);
+    void loadTensorMap(const std::string& map_path);      // deprecated .bin + tensor_map.json
+    void loadTensorsFromGguf(const std::string& gguf_path);
+    void buildLayerMap();
+    bool readLayer(int layer_idx, unsigned char* dst);    // packed layer buffer of size_bytes
     QuantType getQuantTypeFromDtype(const std::string& dtype_str);
 };
 

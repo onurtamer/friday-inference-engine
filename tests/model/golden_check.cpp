@@ -22,6 +22,9 @@
 #include <string>
 #include <vector>
 #include "transformer.h"
+#include "gguf_file.h"
+#include "model_config.h"
+#include <memory>
 #include "io_manager.h"
 #include "tokenizer.h"
 #include "kernel_dispatcher.h"
@@ -97,7 +100,27 @@ int main(int argc, char** argv) {
         const int max_new = gen.at("max_new_tokens").get<int>();
         const std::string prompt = prm.at("prompt").get<std::string>();
 
-        Tokenizer tokenizer(tok_cfg);
+        // A .gguf model carries its own tokenizer and hyper-parameters; the
+        // tensor map and tokenizer arguments are ignored (pass "-"). The
+        // golden dir's model_config.json is then checked against the file.
+        const bool is_gguf = model_path.size() > 5 && model_path.compare(model_path.size() - 5, 5, ".gguf") == 0;
+        std::unique_ptr<Tokenizer> tok_ptr;
+        if (is_gguf) {
+            const friday::GgufFile gguf(model_path);
+            const friday::ModelConfig mc = friday::ModelConfig::fromGguf(gguf);
+            mc.checkSupported();
+            const bool same = mc.num_layers == cfg.at("num_layers").get<int>() &&
+                              mc.hidden_dim == cfg.at("hidden_dim").get<int>() &&
+                              mc.num_heads == cfg.at("num_heads").get<int>() &&
+                              mc.num_kv_heads == cfg.at("num_kv_heads").get<int>() &&
+                              mc.rms_norm_epsilon == cfg.at("rms_norm_epsilon").get<float>();
+            printf("[GOLDEN] GGUF config vs model_config.json: %s\n", same ? "match" : "MISMATCH");
+            if (!same) return 1;
+            tok_ptr.reset(new Tokenizer(gguf));
+        } else {
+            tok_ptr.reset(new Tokenizer(tok_cfg));
+        }
+        Tokenizer& tokenizer = *tok_ptr;
         AsyncIOManager io(model_path);
         Transformer transformer(model_path, tensor_map,
                                 cfg.at("hidden_dim").get<int>(), cfg.at("num_heads").get<int>(),
@@ -212,6 +235,15 @@ int main(int argc, char** argv) {
                 if (d > max_d) { max_d = d; worst = i; }
             }
             ref_ok = ref_mismatch == 0 && g_top1_logprob.size() == ref_top1_lp.size() && max_d < kTop1LogprobTol;
+            // FRIDAY_GOLDEN_DUMP=<file>: per-step token and log-prob of the reference
+            // top-1 token, full precision (to compare two runs bit for bit).
+            if (const char* dump = std::getenv("FRIDAY_GOLDEN_DUMP")) {
+                if (FILE* df = std::fopen(dump, "w")) {
+                    for (size_t i = 0; i < g_top1_logprob.size(); ++i)
+                        std::fprintf(df, "%zu %d %.17g\n", i, i < out.size() ? out[i] : -1, g_top1_logprob[i]);
+                    std::fclose(df);
+                }
+            }
             printf("[REFERENCE] %s: token mismatches %d/%zu | max |top-1 logprob diff| %.4f at step %zu (tol %.2f) | %s\n",
                    ref.value("runtime", std::string("reference")).c_str(), ref_mismatch, ref_tokens.size(),
                    max_d, worst, kTop1LogprobTol, ref_ok ? "PASS" : "FAIL");

@@ -38,6 +38,8 @@ set(FRIDAY_ENGINE_SOURCES
 )
 # Host-only CPU kernels, compiled by the C++ compiler (not nvcc).
 set(FRIDAY_CPU_SOURCES
+    gguf_file.cpp
+    model_config.cpp
     cpu_kquants.cpp
     cpu_ops.cpp
     cpu_threadpool.cpp

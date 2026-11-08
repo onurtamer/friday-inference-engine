@@ -14,6 +14,9 @@
 #include <fstream>
 #include <exception> // Hatalari yakalamak icin eklendi
 #include "transformer.h"
+#include "gguf_file.h"
+#include "model_config.h"
+#include <memory>
 #include "io_manager.h"
 #include "tokenizer.h"
 #include "kernel_dispatcher.h"
@@ -165,33 +168,52 @@ int main(int argc, char** argv) {
         }
         std::cout << "[Init] Secilen model yolu: " << gguf_model_path << "\n" << std::flush;
 
-        std::string tokenizer_config_path = "tokenizer_config.json";
-        
-        createDefaultTokenizerConfigIfNeeded(tokenizer_config_path); 
-
-        Tokenizer tokenizer(tokenizer_config_path);
-        AsyncIOManager async_io_manager(gguf_model_path);
-
+        const bool is_gguf = gguf_model_path.size() > 5 &&
+                             gguf_model_path.compare(gguf_model_path.size() - 5, 5, ".gguf") == 0;
         int hidden_dim = 0;
         int num_heads = 0;
         int num_kv_heads = 0;
         int num_layers = 0;
         float rms_norm_epsilon = 0.0f;
         QuantType model_quant_type = UNKNOWN;
+        std::unique_ptr<Tokenizer> tokenizer_ptr;
 
-        std::ifstream params_file("model_params.json");
-        if (!params_file.is_open()) {
-            fprintf(stderr, "Hata: 'model_params.json' dosyasi bulunamadi.\n");
-            return 1;
+        if (is_gguf) {
+            // Everything comes from the GGUF file: hyper-parameters, tokenizer, tensors.
+            const friday::GgufFile gguf(gguf_model_path);
+            const friday::ModelConfig cfg = friday::ModelConfig::fromGguf(gguf);
+            cfg.checkSupported();
+            hidden_dim = cfg.hidden_dim;
+            num_heads = cfg.num_heads;
+            num_kv_heads = cfg.num_kv_heads;
+            num_layers = cfg.num_layers;
+            rms_norm_epsilon = cfg.rms_norm_epsilon;
+            std::cout << "[Init] " << cfg.architecture << " '" << cfg.name << "': " << cfg.num_layers << " layers, hidden "
+                      << cfg.hidden_dim << ", heads " << cfg.num_heads << "/" << cfg.num_kv_heads << ", "
+                      << (cfg.file_type.empty() ? "?" : cfg.file_type) << "\n";
+            tokenizer_ptr.reset(new Tokenizer(gguf));
+        } else {
+            std::cerr << "[Init] Deprecated: converted .bin + model_params.json + tensor_map.json + tokenizer_config.json. "
+                         "Pass the .gguf file instead; this path will be removed in a later release.\n";
+            std::string tokenizer_config_path = "tokenizer_config.json";
+            createDefaultTokenizerConfigIfNeeded(tokenizer_config_path);
+            tokenizer_ptr.reset(new Tokenizer(tokenizer_config_path));
+            std::ifstream params_file("model_params.json");
+            if (!params_file.is_open()) {
+                fprintf(stderr, "Hata: 'model_params.json' dosyasi bulunamadi.\n");
+                return 1;
+            }
+            nlohmann::json j = nlohmann::json::parse(params_file);
+            hidden_dim = j.at("hidden_dim").get<int>();
+            num_heads = j.at("num_heads").get<int>();
+            num_kv_heads = j.at("num_kv_heads").get<int>();
+            num_layers = j.at("num_layers").get<int>();
+            rms_norm_epsilon = j.at("rms_norm_epsilon").get<float>();
+            model_quant_type = stringToQuantType(j.at("quant_type").get<std::string>());
+            params_file.close();
         }
-        nlohmann::json j = nlohmann::json::parse(params_file);
-        hidden_dim = j.at("hidden_dim").get<int>();
-        num_heads = j.at("num_heads").get<int>();
-        num_kv_heads = j.at("num_kv_heads").get<int>();
-        num_layers = j.at("num_layers").get<int>();
-        rms_norm_epsilon = j.at("rms_norm_epsilon").get<float>();
-        model_quant_type = stringToQuantType(j.at("quant_type").get<std::string>());
-        params_file.close();
+        Tokenizer& tokenizer = *tokenizer_ptr;
+        AsyncIOManager async_io_manager(gguf_model_path);
 
         std::string tensor_map_file = "tensor_map.json";
 

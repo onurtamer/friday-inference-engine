@@ -49,6 +49,14 @@ if(FRIDAY_HAVE_GGUF_PY)
     add_test(NAME kquant_kernels COMMAND test_kquant_kernels ${_fx})
     set_tests_properties(kquant_kernels PROPERTIES LABELS "gpu" FIXTURES_REQUIRED kquant)
 
+    set(_gx ${CMAKE_CURRENT_BINARY_DIR}/gguf_fixtures)
+    add_test(NAME gguf_fixtures
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/make_gguf_fixtures.py ${_gx})
+    set_tests_properties(gguf_fixtures PROPERTIES LABELS "unit" FIXTURES_SETUP gguf)
+    friday_test_target(test_gguf_file unit/test_gguf_file.cpp)
+    add_test(NAME gguf_file COMMAND test_gguf_file ${_gx})
+    set_tests_properties(gguf_file PROPERTIES LABELS "unit" FIXTURES_REQUIRED gguf)
+
     friday_test_target(test_cpu_kquants kernels/test_cpu_kquants.cpp)
     add_test(NAME cpu_kquants COMMAND test_cpu_kquants ${_fx})
     set_tests_properties(cpu_kquants PROPERTIES LABELS "gpu" FIXTURES_REQUIRED kquant)
@@ -62,17 +70,33 @@ set(FRIDAY_MODEL_DIR "" CACHE PATH
 friday_test_target(golden_check model/golden_check.cpp)
 friday_test_target(test_tokenizer_qwen model/test_tokenizer_qwen.cpp)
 if(FRIDAY_MODEL_DIR)
-    # CPU only: engine tokenizer vs. reference Qwen2 tokenizer ids.
-    add_test(NAME tokenizer_qwen_reference
-             COMMAND test_tokenizer_qwen ${FRIDAY_MODEL_DIR}/tokenizer_config.json
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/qwen2_encode_reference.json)
-    set_tests_properties(tokenizer_qwen_reference PROPERTIES LABELS "model")
-    add_test(NAME model_regression_qwen25_32b_q2k
-             COMMAND golden_check
-                     ${FRIDAY_MODEL_DIR}/friday_aligned_int4.bin
-                     ${FRIDAY_MODEL_DIR}/tensor_map.json
-                     ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen25-32b-q2k
-                     ${FRIDAY_MODEL_DIR}/tokenizer_config.json
-                     12.0)
-    set_tests_properties(model_regression_qwen25_32b_q2k PROPERTIES LABELS "model" TIMEOUT 600)
+    set(_gguf ${FRIDAY_MODEL_DIR}/Qwen2.5-32B-Instruct-Q2_K.gguf)
+    if(EXISTS ${_gguf})
+        # CPU only: tokenizer from the GGUF metadata vs. reference Qwen2 tokenizer ids.
+        add_test(NAME tokenizer_qwen_reference_gguf
+                 COMMAND test_tokenizer_qwen ${_gguf}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/qwen2_encode_reference.json)
+        set_tests_properties(tokenizer_qwen_reference_gguf PROPERTIES LABELS "model")
+        # Golden test loading the GGUF directly (tensor map / tokenizer args unused: "-").
+        add_test(NAME model_regression_qwen25_32b_q2k_gguf
+                 COMMAND golden_check ${_gguf} -
+                         ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen25-32b-q2k - 12.0)
+        set_tests_properties(model_regression_qwen25_32b_q2k_gguf PROPERTIES LABELS "model" TIMEOUT 600)
+    endif()
+    # Deprecated converter output (.bin + tensor_map.json + tokenizer_config.json), if present.
+    if(EXISTS ${FRIDAY_MODEL_DIR}/friday_aligned_int4.bin AND EXISTS ${FRIDAY_MODEL_DIR}/tensor_map.json
+       AND EXISTS ${FRIDAY_MODEL_DIR}/tokenizer_config.json)
+        add_test(NAME tokenizer_qwen_reference
+                 COMMAND test_tokenizer_qwen ${FRIDAY_MODEL_DIR}/tokenizer_config.json
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/qwen2_encode_reference.json)
+        set_tests_properties(tokenizer_qwen_reference PROPERTIES LABELS "model")
+        add_test(NAME model_regression_qwen25_32b_q2k
+                 COMMAND golden_check
+                         ${FRIDAY_MODEL_DIR}/friday_aligned_int4.bin
+                         ${FRIDAY_MODEL_DIR}/tensor_map.json
+                         ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen25-32b-q2k
+                         ${FRIDAY_MODEL_DIR}/tokenizer_config.json
+                         12.0)
+        set_tests_properties(model_regression_qwen25_32b_q2k PROPERTIES LABELS "model" TIMEOUT 600)
+    endif()
 endif()

@@ -1,6 +1,8 @@
 #include "transformer.h"
 #include "attention_kernels.h"
 #include "cpu_kquants.h"
+#include "gguf_file.h"
+#include <algorithm>
 #include "cpu_ops.h"
 #include "cpu_threadpool.h"
 #include <cstdlib>
@@ -202,7 +204,14 @@ Transformer::Transformer(
     printf("Transformer initialized with GGUF parameters: hidden_dim=%d, num_heads=%d, num_kv_heads=%d, num_layers=%d, epsilon=%f, QuantType=%d\n",
            hidden_dim_, num_heads_, num_kv_heads_, num_layers_, rms_norm_epsilon_, model_quant_type_);
 
-    loadTensorMap(tensor_map_path);
+    if (model_file_path.size() > 5 && model_file_path.compare(model_file_path.size() - 5, 5, ".gguf") == 0) {
+        loadTensorsFromGguf(model_file_path);
+    } else {
+        fprintf(stderr, "[Transformer] Deprecated: loading a converted .bin + tensor map. Pass the .gguf file "
+                        "directly; converter.py support will be removed in a later release.\n");
+        loadTensorMap(tensor_map_path);
+    }
+    buildLayerMap();
 
     // Determine max intermediate size for MLP
     for (const auto& item : full_tensor_map_) {
@@ -369,7 +378,7 @@ Transformer::Transformer(
     for (int l = 0; l < num_gpu_resident_layers_; ++l) {
         const auto& l_info = layers_info_[l];
         CUDA_CHECK(cudaMalloc((void**)&d_gpu_resident_layers_[l], l_info.size_bytes));
-        async_io_manager_ptr_->readLayerToHost(l_info.start_offset, l_info.size_bytes, temp_load_buf.data());
+        if (!readLayer(l, temp_load_buf.data())) throw std::runtime_error("Failed to read layer " + std::to_string(l));
         CUDA_CHECK(cudaMemcpy(d_gpu_resident_layers_[l], temp_load_buf.data(), l_info.size_bytes, cudaMemcpyHostToDevice));
     }
     if (num_gpu_resident_layers_ > 0) {
@@ -382,7 +391,7 @@ Transformer::Transformer(
         for (int i = 0; i < num_streamed; ++i) {
             const auto& l_info = layers_info_[num_gpu_resident_layers_ + i];
             h_cpu_layers_[i].reset(new unsigned char[l_info.size_bytes]);
-            if (!async_io_manager_ptr_->readLayerToHost(l_info.start_offset, l_info.size_bytes, h_cpu_layers_[i].get())) {
+            if (!readLayer(num_gpu_resident_layers_ + i, h_cpu_layers_[i].get())) {
                 throw std::runtime_error("Failed to read layer " + std::to_string(num_gpu_resident_layers_ + i));
             }
         }
@@ -402,8 +411,7 @@ Transformer::Transformer(
         cpu_pool_.reset(new friday_cpu::ThreadPool(cpu_threads));
         printf("[Transformer] %d layers in host RAM (%.2f GB), computed on the CPU with %d threads (%s)\n",
                num_streamed,
-               (double)(layers_info_.back().start_offset + layers_info_.back().size_bytes -
-                        layers_info_[num_gpu_resident_layers_].start_offset) / (1u << 30),
+               [&] { size_t b = 0; for (int l = num_gpu_resident_layers_; l < num_layers_; ++l) b += layers_info_[l].size_bytes; return (double)b / (1u << 30); }(),
                cpu_pool_->size(), friday_cpu::hasAvx2() ? "AVX2" : "scalar");
     }
 
@@ -430,7 +438,7 @@ Transformer::Transformer(
             const auto& l_info = layers_info_[l_idx];
             cudaError_t err = cudaMallocHost((void**)&h_offload_pinned_cache_[i], l_info.size_bytes);
             if (err == cudaSuccess) {
-                async_io_manager_ptr_->readLayerToHost(l_info.start_offset, l_info.size_bytes, h_offload_pinned_cache_[i]);
+                if (!readLayer(l_idx, h_offload_pinned_cache_[i])) throw std::runtime_error("Failed to read layer " + std::to_string(l_idx));
             } else {
                 all_pinned_ok = false;
                 for (int j = 0; j < i; ++j) {
@@ -518,7 +526,27 @@ void Transformer::loadTensorMap(const std::string& map_path) {
         exit(EXIT_FAILURE);
     }
     f.close();
+}
 
+void Transformer::loadTensorsFromGguf(const std::string& gguf_path) {
+    const friday::GgufFile g(gguf_path);
+    for (const auto& t : g.tensors()) {
+        const char* type_name = friday::ggmlTypeName(t.type);
+        TensorInfo info;
+        info.name = t.name;
+        info.absolute_offset = (size_t)t.offset;
+        info.size_bytes = (size_t)t.size;
+        info.shape.assign(t.ne.begin(), t.ne.end());
+        info.dtype = type_name ? type_name : "UNKNOWN";
+        full_tensor_map_[info.name] = info;
+    }
+    printf("[Transformer] %zu tensors from GGUF v%u '%s'\n", full_tensor_map_.size(), g.version(), gguf_path.c_str());
+}
+
+// Groups blk.<l>.* tensors into one packed buffer per layer. Tensors are copied
+// one by one (GGUF does not guarantee that a layer's tensors are contiguous in
+// the file), each at a 256-byte aligned offset inside the layer buffer.
+void Transformer::buildLayerMap() {
     layers_info_.resize(num_layers_);
     std::vector<std::vector<TensorInfo>> layer_tensors(num_layers_);
 
@@ -541,18 +569,18 @@ void Transformer::loadTensorMap(const std::string& map_path) {
             fprintf(stderr, "Hata: Katman %d icin tensor bulunamadi!\n", l);
             exit(EXIT_FAILURE);
         }
-        size_t min_offset = std::numeric_limits<size_t>::max();
-        size_t max_end = 0;
-        for (const auto& t : layer_tensors[l]) {
-            if (t.absolute_offset < min_offset) min_offset = t.absolute_offset;
-            size_t end_off = t.absolute_offset + t.size_bytes;
-            if (end_off > max_end) max_end = end_off;
+        auto& lt = layer_tensors[l];
+        std::sort(lt.begin(), lt.end(), [](const TensorInfo& a, const TensorInfo& b) {
+            return a.absolute_offset < b.absolute_offset;
+        });
+        size_t cur = 0;
+        for (const auto& t : lt) {
+            cur = (cur + 255) / 256 * 256;
+            layers_info_[l].chunks.push_back({t.absolute_offset, t.size_bytes, cur});
+            layers_info_[l].tensor_rel_offsets[t.name] = cur;
+            cur += t.size_bytes;
         }
-        layers_info_[l].start_offset = min_offset;
-        layers_info_[l].size_bytes = max_end - min_offset;
-        for (const auto& t : layer_tensors[l]) {
-            layers_info_[l].tensor_rel_offsets[t.name] = t.absolute_offset - min_offset;
-        }
+        layers_info_[l].size_bytes = cur;
         if (layers_info_[l].size_bytes > max_layer_size) {
             max_layer_size = layers_info_[l].size_bytes;
         }
@@ -563,6 +591,17 @@ void Transformer::loadTensorMap(const std::string& map_path) {
 
     size_t aligned_max = ((max_layer_size + 1048575) / 1048576) * 1048576;
     layer_buffer_size_ = std::max((size_t)(32 * 1024 * 1024), aligned_max);
+}
+
+bool Transformer::readLayer(int layer_idx, unsigned char* dst) {
+    const auto& li = layers_info_[layer_idx];
+    size_t filled = 0;
+    for (const auto& c : li.chunks) {
+        if (c.rel_offset > filled) std::memset(dst + filled, 0, c.rel_offset - filled);  // alignment padding
+        if (!async_io_manager_ptr_->readLayerToHost(c.file_offset, c.size, dst + c.rel_offset)) return false;
+        filled = c.rel_offset + c.size;
+    }
+    return true;
 }
 
 void Transformer::applyRMSNorm(
@@ -976,7 +1015,7 @@ void Transformer::forward(
                 // Fallback: read from disk into this slot's pinned staging buffer.
                 // Wait until the previous copy out of that staging buffer has finished.
                 CUDA_CHECK(cudaEventSynchronize(ev_slot_ready_[slot]));
-                if (!async_io_manager_ptr_->readLayerToHost(info.start_offset, info.size_bytes, h_pinned_buffer_[slot])) {
+                if (!readLayer(first_stream_layer + offload_idx, h_pinned_buffer_[slot])) {
                     throw std::runtime_error("Failed to read streamed layer " +
                                              std::to_string(first_stream_layer + offload_idx) + " from disk");
                 }

@@ -15,9 +15,12 @@
 // encoder (with a warning); that path does not match the reference tokenizer.
 // Not implemented: Unicode NFC normalization of the input (input is assumed
 // to be NFC already).
+namespace friday { class GgufFile; }
+
 class Tokenizer {
 public:
     explicit Tokenizer(const std::string& config_path);
+    explicit Tokenizer(const friday::GgufFile& gguf);   // tokenizer.ggml.* metadata
 
     std::vector<int> encode(const std::string& text) const;
     std::string decode(const std::vector<int>& tokens) const;
@@ -40,6 +43,7 @@ public:
     void parseConfigFile(const std::string& config_path);
 
 private:
+    void finishInit(const std::string& source);
     void encodeBpe(const std::string& piece, std::vector<int>& out) const;
     void encodeGreedyLegacy(const std::string& segment, std::vector<int>& out) const;
 

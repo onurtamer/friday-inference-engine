@@ -7,10 +7,16 @@
 #include <nlohmann/json.hpp>
 #include "check.h"
 #include "tokenizer.h"
+#include "gguf_file.h"
+#include <memory>
 
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: test_tokenizer_qwen <config> <reference>\n"); return 2; }
-    Tokenizer tok(argv[1]);
+    // argv[1]: tokenizer_config.json, or a .gguf file (tokenizer from its metadata).
+    const std::string src = argv[1];
+    const bool is_gguf = src.size() > 5 && src.compare(src.size() - 5, 5, ".gguf") == 0;
+    std::unique_ptr<friday::GgufFile> gguf(is_gguf ? new friday::GgufFile(src) : nullptr);
+    Tokenizer tok = is_gguf ? Tokenizer(*gguf) : Tokenizer(src);
     CHECK(tok.hasMerges());
     std::ifstream f(argv[2]);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[2]); return 2; }

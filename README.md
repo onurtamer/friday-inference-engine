@@ -37,12 +37,11 @@ FRIDAY Engine splits a model between the GPU and the CPU (**Elastic Tiered Memor
 ```mermaid
 flowchart TD
     subgraph Storage["1. Storage & Preprocessing"]
-        GGUF["Qwen2.5-14B-Instruct-Q4_0.gguf"] -->|converter.py| BIN["friday_aligned_int4.bin (4KB Aligned)"]
-        GGUF -->|converter.py| MAP["tensor_map.json + model_params.json"]
+        GGUF["model.gguf (e.g. Qwen2.5-32B-Instruct-Q2_K)"] -->|GGUF reader| META["hyper-parameters + tokenizer + tensor table"]
     end
 
     subgraph Initialization["2. Elastic Tiered Memory Initialization"]
-        BIN --> ETM["Elastic Tiered Memory Manager"]
+        META --> ETM["Elastic Tiered Memory Manager"]
         ETM -->|Static Tensors| EMB["output.weight + output_norm (GPU), token_embd (host RAM)"]
         ETM -->|VRAM budget incl. KV cache| GPU_LAYERS["GPU layers 0 .. N-1 + their KV cache"]
         ETM -->|Rest| HOST_LAYERS["CPU layers N .. L-1 in host RAM + their KV cache"]
@@ -88,8 +87,8 @@ FRIDAY Engine implements a **two-pass online Safe Softmax**:
 - Native ChatML support (`<|im_start|>system...<|im_end|><|im_start|>user...<|im_end|><|im_start|>assistant`).
 - **Real-Time Token Streaming:** Tokens appear immediately on the console (`std::flush`) with negligible latency as they are decoded.
 
-### 5. 📦 4KB Sector-Aligned Weight Serialization (`converter.py`)
-Standard GGUF files place tensor payloads at variable byte alignments. FRIDAY includes a standalone Python utility (`converter.py`) that reads standard GGUF models and serializes them into **4096-byte sector-aligned binary files (`friday_aligned_int4.bin`)**. The alignment is a prerequisite for unbuffered I/O (`O_DIRECT` / `FILE_FLAG_NO_BUFFERING`); the current loader still uses buffered `fread`, and unbuffered I/O is planned (roadmap R4).
+### 5. 📦 Direct GGUF Loading
+The engine reads `.gguf` files directly: hyper-parameters and the tokenizer come from the GGUF metadata, and each layer's tensors are read into one packed buffer (GGUF does not guarantee that a layer's tensors are contiguous). The C++ reader is bounds-checked and rejects truncated or malformed files. The older `converter.py` workflow (4 KB-aligned `friday_aligned_int4.bin` + `tensor_map.json` + `model_params.json` + `tokenizer_config.json`) still works but is **deprecated** and will be removed in a later release.
 
 ---
 
@@ -113,9 +112,9 @@ friday-inference-engine/
 ├── tokenizer.h                 # BPE Tokenizer interface
 ├── tokenizer.cpp               # BPE encoding, ChatML parser, and UTF-8 mapper
 ├── friday_types.h              # Platform I/O types and alignment constants
-├── converter.py                # Standalone GGUF -> 4KB Aligned BIN converter
-├── model_params.json           # Model configuration parameters (dim, heads, layers)
-├── tensor_map.json             # Offset and dimension lookup table for weights
+├── gguf_file.h/.cpp            # Bounds-checked GGUF reader (metadata + tensor table)
+├── model_config.h/.cpp         # Hyper-parameters from GGUF metadata
+├── converter.py                # Deprecated: GGUF -> 4KB aligned .bin + tensor_map.json
 ├── include/
 │   └── nlohmann/
 │       └── json.hpp            # Header-only JSON library for parameter mapping
@@ -144,12 +143,8 @@ git clone https://github.com/onurtamer/friday-inference-engine.git
 cd friday-inference-engine
 ```
 
-### Step 2: Download & Convert a Model
-Download the official GGUF weight for `Qwen2.5-14B-Instruct-Q4_0` (or any compatible model) and run the converter:
-```bash
-python converter.py --input Qwen2.5-14B-Instruct-Q4_0.gguf
-```
-*This produces `friday_aligned_int4.bin`, `tensor_map.json`, `model_params.json`, and `tokenizer_config.json`.*
+### Step 2: Download a Model
+Download a GGUF file of a supported model, e.g. `Qwen2.5-32B-Instruct-Q2_K.gguf` (architecture `qwen2`; Llama 3.x and Qwen3 are planned in roadmap R2c). No conversion step is needed.
 
 ### Step 3: Build the Engine
 Build the project in `Release` mode using CMake:
@@ -163,21 +158,21 @@ cmake --build build --config Release
 Launch the engine with your preferred VRAM allocation:
 ```bash
 # Auto-detect available VRAM:
-.\build\Release\FridayEngine.exe
+.\build\Release\FridayEngine.exe Qwen2.5-32B-Instruct-Q2_K.gguf
 
 # Or cap the VRAM budget (e.g., 6.0 GB):
-.\build\Release\FridayEngine.exe --vram 6.0 friday_aligned_int4.bin
+.\build\Release\FridayEngine.exe --vram 6.0 Qwen2.5-32B-Instruct-Q2_K.gguf
 ```
 
 ### Step 5: Run the Tests
 ```bash
-cmake -B build -A x64 -DFRIDAY_MODEL_DIR=<dir with friday_aligned_int4.bin, tensor_map.json, tokenizer_config.json>
+cmake -B build -A x64 -DFRIDAY_MODEL_DIR=<dir with Qwen2.5-32B-Instruct-Q2_K.gguf>
 cmake --build build --config Release
 ctest --test-dir build -C Release -L unit    # CPU only, < 10 s
 ctest --test-dir build -C Release -L gpu     # GPU kernels vs. gguf reference (needs Python gguf + numpy)
 ctest --test-dir build -C Release -L model   # end-to-end regression snapshot, ~1 min
 ```
-Tests labelled `known-failing` document open defects and are expected to fail until fixed. The `model` label also includes a CPU-only tokenizer test against reference Qwen2 token ids; it needs a `tokenizer_config.json` with BPE merges (written by `converter.py` or `tools/export_tokenizer.py`).
+Tests labelled `known-failing` document open defects and are expected to fail until fixed. The `model` label also includes CPU-only tokenizer tests against reference Qwen2 token ids (tokenizer read from the GGUF). Tests for the deprecated `.bin` path run only if `friday_aligned_int4.bin`, `tensor_map.json` and `tokenizer_config.json` are also present.
 
 ---
 
@@ -188,7 +183,7 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | `--vram` | `<float>` | Maximum GPU VRAM to allocate for weights and buffers (in GB). | `0.0` (Auto-detect free VRAM) |
 | `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). GPU layers keep it in VRAM (fp16, 4 KiB per token per layer for Qwen2.5-32B), CPU layers in host RAM. | `2048` |
 | `--threads` | `<int>` | CPU threads for the CPU-computed layers. | `0` (2/3 of the logical CPUs) |
-| `<model_path>`| `<string>` | Path to the 4KB sector-aligned binary model file. | `friday_aligned_int4.bin` |
+| `<model_path>`| `<string>` | Path to the `.gguf` model file (a converted `.bin` is still accepted, deprecated). | `friday_aligned_int4.bin` |
 
 ---
 

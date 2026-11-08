@@ -17,7 +17,8 @@ recorded, docs updated, commit reviewed.
   layers). Baseline measured 2026-11-07 on RTX 3060 12 GB with
   Qwen2.5-32B Q2_K, 55/64 layers resident: 1.5–1.6 tok/s decode against an
   estimated ceiling of ~10 tok/s.
-- **Order:** R0 → R1 → R4 (CUDA) → R5 → R2 → R3 → R6 → R7 → R8.
+- **Order:** R0 → R1 → R4 steps 1–3 (done) → R2 → R3 → R4 → R5 → R4b → R6 → R7 → R8
+  (re-ordered 2026-11-08 after R1: model loading and backends before the remaining tuning).
   ARM-side optimizations follow with the backend HAL in R3.
 
 ## Progress
@@ -35,6 +36,17 @@ recorded, docs updated, commit reviewed.
         GPU tests and on a 2-token model run (memcheck, racecheck; initcheck needs more host RAM than this 16 GB machine has with the 32B model); ASAN (MSVC) clean on unit/GPU tests and the full model golden test.
   - [x] Build warnings fixed (C4297, LNK4098, C4005); CMake sm_86 default was dead
         code (set after `project()`, everything built for sm_52) — fixed.
+- **R2 — in progress.**
+  - [x] R2a: direct GGUF loading. Bounds-checked C++ GGUF reader (unit test vs.
+        gguf-py, 9 malformed files rejected), hyper-parameters and tokenizer from
+        metadata, per-tensor packed layer buffers (GGUF layers are not always
+        contiguous). Qwen2.5-32B from the `.gguf`: golden PASS and per-step
+        log-probs bit-identical to the converted `.bin`. converter.py deprecated.
+  - [ ] R2b: model registry (path, SHA-256, license, architecture, quant) in a
+        JSON file in the user config dir; `models list/add`.
+  - [ ] R2c: Llama 3.x (RoPE mode, no qkv bias, llama-bpe pre-tokenizer) and Qwen3
+        (q/k norm); Q5_K/Q6_K/Q8_0 CPU and GPU dp4a kernels; golden vs llama.cpp
+        for Llama-3.1-8B-Instruct Q4_K_M.
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).
@@ -71,7 +83,8 @@ recorded, docs updated, commit reviewed.
 | R1 | Correctness foundation | Per-model golden tests; tokenizer matches reference byte-for-byte; kernel tests against GGUF reference dequantization for every supported quant type; logits within tolerance of a reference runtime; KV layout bug fixed; ASAN + compute-sanitizer clean |
 | R2 | Model loading | Direct GGUF parsing (no tensor_map/convert step); model registry with hash, license, architecture; Qwen2.5/3 + Llama/Mistral |
 | R3 | Backend + platform HAL (Windows and Linux) | Backend interface; CUDA backend from existing kernels; CPU backend (AVX2 + NEON); capability report; ARM cross-compile + QEMU tests |
-| R4 | Measured optimizations | Profile first; GPU attention/KV (currently CPU), non-blocking streams, bandwidth-efficient GEMV, CUDA Graphs and kernel fusion, batched prefill, kernel-bypass memory/IO; decode ≥60% of the computed ceiling; per-platform before/after tok/s and numerical diff |
+| R4 | Measured optimizations (decode) | Done: GPU attention/KV, bandwidth-efficient GEMV, CPU-computed layers. Remaining: split-K decode attention, CUDA Graphs and kernel fusion, 8-bit KV cache; decode ≥60% of the computed ceiling (GPU + CPU layers); per-platform before/after tok/s and numerical diff |
+| R4b | Prefill & I/O | Batched prefill (tensor-core int8 GEMM on the GPU, batched CPU GEMM, causal batched attention); kernel-bypass memory/IO (unbuffered/direct reads, large pages); prefill tok/s vs llama.cpp on the same machine |
 | R5 | Benchmarks & performance model | Controlled benchmark tool (N repeats, median/p95, records free RAM, GPU clocks and background load); measured table (RTX 3060, Ryzen 5600X); estimate table for other GPUs/ARM boards; published methodology |
 | R6 | Chat & persistent memory | Per-model chat templates; sessions; SQLite + FTS memory with provenance, edit and delete |
 | R7 | API server & router | OpenAI-compatible HTTP, SSE streaming, cancel, queue, multi-model routing; localhost default, token auth |
