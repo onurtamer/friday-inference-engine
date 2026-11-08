@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 
 #if defined(_MSC_VER)
@@ -196,6 +197,87 @@ static inline void q3kScales(const uint8_t* s, int* out) {
         const int high = (s[8 + (j % 4)] >> (2 * (j / 4))) & 3;
         out[j] = (low | (high << 4)) - 32;
     }
+}
+
+
+bool kquantFromDtype(const std::string& dtype, KQuant* out) {
+    if (dtype == "Q2_K") *out = KQuant::Q2_K;
+    else if (dtype == "Q3_K") *out = KQuant::Q3_K;
+    else if (dtype == "Q4_K") *out = KQuant::Q4_K;
+    else if (dtype == "Q5_K") *out = KQuant::Q5_K;
+    else if (dtype == "Q6_K") *out = KQuant::Q6_K;
+    else if (dtype == "Q8_0") *out = KQuant::Q8_0;
+    else return false;
+    return true;
+}
+
+size_t rowBytesOf(const std::string& dtype, int dim) {
+    if (dtype == "Q4_0") return (size_t)(dim / 32) * 18;
+    if (dtype == "Q8_0") return (size_t)(dim / 32) * 34;
+    if (dtype == "Q2_K") return (size_t)(dim / 256) * 84;
+    if (dtype == "Q3_K") return (size_t)(dim / 256) * 110;
+    if (dtype == "Q4_K") return (size_t)(dim / 256) * 144;
+    if (dtype == "Q5_K") return (size_t)(dim / 256) * 176;
+    if (dtype == "Q6_K") return (size_t)(dim / 256) * 210;
+    if (dtype == "F16") return (size_t)dim * 2;
+    if (dtype == "F32") return (size_t)dim * 4;
+    return 0;
+}
+
+// Same formulas as the GPU row kernels in transformer.cpp (fp32 math).
+bool dequantizeRow(const std::string& dtype, const uint8_t* row, float* out, int dim) {
+    for (int idx = 0; idx < dim; ++idx) {
+        float v;
+        if (dtype == "Q4_0") {
+            const uint8_t* b = row + (idx / 32) * 18;
+            const int i = idx % 32;
+            const int q = (i < 16 ? (b[2 + i] & 0x0F) : (b[2 + i - 16] >> 4)) - 8;
+            v = f16(b) * (float)q;
+        } else if (dtype == "Q8_0") {
+            const uint8_t* b = row + (idx / 32) * 34;
+            v = f16(b) * (float)reinterpret_cast<const int8_t*>(b + 2)[idx % 32];
+        } else if (dtype == "Q2_K") {
+            const uint8_t* b = row + (idx / 256) * 84;
+            const int r = idx % 256, h = r / 128, j = (r % 128) / 32, l = r % 32;
+            const uint8_t sc = b[h * 8 + j * 2 + (l >= 16 ? 1 : 0)];
+            const int q = (b[16 + h * 32 + l] >> (2 * j)) & 3;
+            v = f16(b + 80) * (float)(sc & 0x0F) * (float)q - f16(b + 82) * (float)(sc >> 4);
+        } else if (dtype == "Q3_K") {
+            const uint8_t* b = row + (idx / 256) * 110;
+            const int r = idx % 256, h = r / 128, s = (r % 128) / 32, l = r % 32;
+            int sc[16];
+            q3kScales(b + 96, sc);
+            const int q = ((b[32 + h * 32 + l] >> (2 * s)) & 3) - ((b[l] & (1 << (h * 4 + s))) ? 0 : 4);
+            v = f16(b + 108) * (float)sc[h * 8 + 2 * s + (l >= 16 ? 1 : 0)] * (float)q;
+        } else if (dtype == "Q4_K" || dtype == "Q5_K") {
+            const bool q5 = dtype == "Q5_K";
+            const uint8_t* b = row + (idx / 256) * (q5 ? 176 : 144);
+            const int r = idx % 256, j = r / 64, hi = (r % 64) / 32, l = r % 32;
+            const int is = 2 * j + hi;
+            int sc, m;
+            q4kScaleMin(is, b + 4, sc, m);
+            const uint8_t qb = b[(q5 ? 48 : 16) + 32 * j + l];
+            int q = hi ? (qb >> 4) : (qb & 0xF);
+            if (q5) q += ((b[16 + l] >> is) & 1) << 4;
+            v = f16(b) * (float)sc * (float)q - f16(b + 2) * (float)m;
+        } else if (dtype == "Q6_K") {
+            const uint8_t* b = row + (idx / 256) * 210;
+            const int r = idx % 256, h = r / 128, part = (r % 128) / 32, l = r % 32;
+            const uint8_t ql = b[h * 64 + l + (part & 1) * 32];
+            const int lo = (part < 2) ? (ql & 0xF) : (ql >> 4);
+            const int q = (lo | (((b[128 + h * 32 + l] >> (2 * part)) & 3) << 4)) - 32;
+            const int8_t sc = reinterpret_cast<const int8_t*>(b + 192)[h * 8 + (l / 16) + 2 * part];
+            v = f16(b + 208) * (float)sc * (float)q;
+        } else if (dtype == "F16") {
+            v = f16(row + 2 * idx);
+        } else if (dtype == "F32") {
+            std::memcpy(&v, row + 4 * idx, 4);
+        } else {
+            return false;
+        }
+        out[idx] = v;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

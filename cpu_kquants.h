@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace friday_cpu {
@@ -33,6 +34,13 @@ void quantizeActivation(const float* x, int K, Q8Activation& out);
 void roundToHalf(float* x, int n);
 
 size_t rowBytes(KQuant t, int K);
+
+// GGUF dtype name ("Q4_K", ...) -> KQuant; false if there is no CPU GEMV for it.
+bool kquantFromDtype(const std::string& dtype, KQuant* out);
+// Bytes of one row of `dim` values for a dtype (also Q4_0/F16/F32); 0 if unknown.
+size_t rowBytesOf(const std::string& dtype, int dim);
+// Dequantizes one row (embedding lookup); false for unsupported dtypes.
+bool dequantizeRow(const std::string& dtype, const uint8_t* row, float* out, int dim);
 
 // y[r] = dot(W row r, x) for r in [r0, r1). K must be a multiple of 256.
 // (Q5_K 176 B per 256, Q8_0 34 B per 32.)

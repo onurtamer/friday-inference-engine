@@ -21,27 +21,12 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include "transformer.h"
+#include <memory>
+#include <nlohmann/json.hpp>
+#include "engine.h"
 #include "gguf_file.h"
 #include "model_config.h"
-#include <memory>
-#include "io_manager.h"
 #include "tokenizer.h"
-#include "kernel_dispatcher.h"
-#include <nlohmann/json.hpp>
-
-static QuantType quantFromString(const std::string& s) {
-    if (s == "F16" || s == "F32") return FP16;
-    if (s == "Q4_0") return INT4;
-    if (s == "Q4_1") return Q4_1;
-    if (s == "Q8_0" || s == "Q8_1") return INT8;
-    if (s == "Q6_K") return Q6_K;
-    if (s == "Q2_K") return Q2_K;
-    if (s == "Q3_K") return Q3_K;
-    if (s == "Q4_K") return Q4_K;
-    if (s == "Q5_K") return Q5_K;
-    return UNKNOWN;
-}
 
 // Optional reference-runtime check: log-probability this engine assigns, at each
 // generated step, to the reference runtime's top-1 token.
@@ -49,13 +34,12 @@ static const std::vector<int>* g_ref_top1 = nullptr;
 static std::vector<double> g_top1_logprob;
 
 // Same selection rule as main.cpp: skip NaN/Inf, first maximum wins.
-static int argmaxLogits(const half* d_logits, int vocab, cudaStream_t s, int* nan_count) {
-    std::vector<half> h(vocab);
-    CUDA_CHECK(cudaMemcpyAsync(h.data(), d_logits, vocab * sizeof(half), cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaStreamSynchronize(s));
+// Logits come from Engine::step (host floats; on the GPU path the exact
+// values of the fp16 logits).
+static int argmaxLogits(const std::vector<float>& h, int vocab, int* nan_count) {
     int best = -1; float best_v = -1e30f; int nans = 0;
     for (int i = 0; i < vocab; ++i) {
-        float v = __half2float(h[i]);
+        float v = h[i];
         if (std::isnan(v) || std::isinf(v)) { ++nans; continue; }
         if (v > best_v) { best_v = v; best = i; }
     }
@@ -64,10 +48,10 @@ static int argmaxLogits(const half* d_logits, int vocab, cudaStream_t s, int* na
     if (g_ref_top1 && step < g_ref_top1->size() && best >= 0) {
         double z = 0;
         for (int i = 0; i < vocab; ++i) {
-            float v = __half2float(h[i]);
+            float v = h[i];
             if (std::isfinite(v)) z += std::exp((double)v - best_v);
         }
-        const float x = __half2float(h[(*g_ref_top1)[step]]);
+        const float x = h[(*g_ref_top1)[step]];
         g_top1_logprob.push_back(std::isfinite(x) ? (double)x - best_v - std::log(z) : -1e30);
     }
     return best;
@@ -122,20 +106,22 @@ int main(int argc, char** argv) {
             tok_ptr.reset(new Tokenizer(tok_cfg));
         }
         Tokenizer& tokenizer = *tok_ptr;
-        AsyncIOManager io(model_path);
-        Transformer transformer(model_path, tensor_map,
-                                cfg.at("hidden_dim").get<int>(), cfg.at("num_heads").get<int>(),
-                                cfg.at("num_kv_heads").get<int>(), cfg.at("num_layers").get<int>(),
-                                cfg.at("rms_norm_epsilon").get<float>(),
-                                quantFromString(cfg.at("quant_type").get<std::string>()), &io, vram_gb);
+        friday::EngineOptions eo;
+        eo.model_path = model_path;
+        eo.vram_gb = vram_gb;
+        eo.tensor_map = tensor_map;  // deprecated .bin path only
+        eo.hidden_dim = cfg.at("hidden_dim").get<int>();
+        eo.num_heads = cfg.at("num_heads").get<int>();
+        eo.num_kv_heads = cfg.at("num_kv_heads").get<int>();
+        eo.num_layers = cfg.at("num_layers").get<int>();
+        eo.rms_norm_epsilon = cfg.at("rms_norm_epsilon").get<float>();
+        eo.quant_type = cfg.at("quant_type").get<std::string>();
+        friday::Engine engine(eo);
+        printf("[GOLDEN] %s\n", engine.summary().c_str());
 
-        int vocab = transformer.getVocabSize();
+        int vocab = engine.vocabSize();
         if (vocab == 0) vocab = tokenizer.getVocabSize();
-        const int hidden = cfg.at("hidden_dim").get<int>();
-        half* d_logits = nullptr; half* d_act = nullptr;
-        CUDA_CHECK(cudaMalloc((void**)&d_logits, vocab * sizeof(half)));
-        CUDA_CHECK(cudaMalloc((void**)&d_act, hidden * sizeof(half)));
-        cudaStream_t s; CUDA_CHECK(cudaStreamCreate(&s));
+        std::vector<float> logits(vocab);
 
         std::vector<int> tokens;
         if (argc >= 7) {  // optional: prompt token ids from file ("n=..." line, then ids)
@@ -169,14 +155,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        auto step = [&](int tok, int pos) {
-            if (!transformer.getEmbedding(tok, d_act, vocab, s))
-                throw std::runtime_error("embedding failed for token " + std::to_string(tok));
-            CUDA_CHECK(cudaStreamSynchronize(s));
-            CUDA_CHECK(cudaMemsetAsync(d_logits, 0, vocab * sizeof(half), s));
-            transformer.forward(d_act, d_logits, 1, 0, pos, s);
-            CUDA_CHECK(cudaStreamSynchronize(s));
-        };
+        auto step = [&](int tok, int pos) { engine.step(tok, pos, logits.data()); };
 
         auto t0 = std::chrono::steady_clock::now();
         if (max_steps > 0) {
@@ -187,14 +166,13 @@ int main(int argc, char** argv) {
                        std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
             }
             printf("[GOLDEN] smoke run finished after %d steps (no comparison)\n", max_steps);
-            CUDA_CHECK(cudaFree(d_logits)); CUDA_CHECK(cudaFree(d_act)); CUDA_CHECK(cudaStreamDestroy(s));
             return 0;
         }
         for (size_t i = 0; i < prompt_len; ++i) step(tokens[i], (int)i);
         auto t1 = std::chrono::steady_clock::now();
 
         std::vector<int> out;
-        int next = argmaxLogits(d_logits, vocab, s, &nans); total_nans += nans;
+        int next = argmaxLogits(logits, vocab, &nans); total_nans += nans;
         for (int k = 0; k < max_new; ++k) {
             if (next < 0) throw std::runtime_error("all logits NaN/Inf at step " + std::to_string(k));
             out.push_back(next);
@@ -205,7 +183,7 @@ int main(int argc, char** argv) {
             const int feed = (k < (int)ref_tokens.size()) ? ref_tokens[k] : next;
             tokens.push_back(feed);
             step(feed, (int)tokens.size() - 1);
-            next = argmaxLogits(d_logits, vocab, s, &nans); total_nans += nans;
+            next = argmaxLogits(logits, vocab, &nans); total_nans += nans;
         }
         auto t2 = std::chrono::steady_clock::now();
 
@@ -277,7 +255,6 @@ int main(int argc, char** argv) {
         const bool pass = mismatches == 0 && ref_ok;
         printf("[GOLDEN] RESULT: %s\n", pass ? "PASS" : "FAIL");
 
-        cudaFree(d_logits); cudaFree(d_act); cudaStreamDestroy(s);
         return pass ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "[GOLDEN] ERROR: " << e.what() << "\n";

@@ -22,33 +22,14 @@
     } while (0)
 #endif
 
-// Tensor bilgilerini tutacak yapı
-struct TensorInfo {
-    std::string name;
-    size_t absolute_offset;
-    size_t size_bytes;
-    std::vector<long long> shape;
-    std::string dtype; // GGUF Dtype, örn: Q4_0, F16
-
-    TensorInfo() : name(""), absolute_offset(0), size_bytes(0), shape({}), dtype("") {}
-};
+#include "model_layout.h"   // TensorInfo, LayerInfo, friday::ModelLayout
+#include "cpu_backend.h"    // friday::CpuLayerRunner
 
 // AsyncIOManager sınıfının forward deklarasyonu
 class AsyncIOManager; 
 namespace friday_cpu { class ThreadPool; }
 enum QuantType; // kernel_dispatcher.h'den
 
-// Katman yapısını ve tensör bağıl ofsetlerini tutan yapı (Zero cudaMalloc mimarisi)
-struct LayerChunk {
-    size_t file_offset;   // absolute offset in the model file
-    size_t size;          // bytes
-    size_t rel_offset;    // offset inside the packed layer buffer
-};
-struct LayerInfo {
-    size_t size_bytes = 0;                            // packed size
-    std::map<std::string, size_t> tensor_rel_offsets; // tensor name -> offset in the packed buffer
-    std::vector<LayerChunk> chunks;                   // file ranges to read, in file order
-};
 
 // Dequantize one embedding row (Q4_0, Q2_K, Q3_K, Q4_K, Q6_K or F16) on the GPU.
 // Returns false for unsupported types or launch errors.
@@ -131,7 +112,8 @@ public:
         return 0;
     }
 
-    std::map<std::string, TensorInfo> full_tensor_map_;
+    friday::ModelLayout layout_;                                    // tensors + packed layers
+    std::map<std::string, TensorInfo>& full_tensor_map_ = layout_.tensors;
 
 private:
     std::string model_file_path_;
@@ -163,13 +145,8 @@ private:
     // FRIDAY_OFFLOAD=stream selects the previous mode: stream the layer weights
     // over PCIe into DMA slots every token and compute on the GPU.
     bool cpu_offload_ = true;
-    std::vector<std::unique_ptr<unsigned char[]>> h_cpu_layers_;  // [layer - num_gpu_resident_layers_]
-    std::unique_ptr<friday_cpu::ThreadPool> cpu_pool_;
-    std::vector<float> cpu_k_cache_, cpu_v_cache_;  // [cpu layer][max_ctx][kv_dim], fp16-rounded values
-    half* h_act_pinned_ = nullptr;                   // hidden state staging for GPU <-> CPU hand-off
-    std::vector<float> cpu_x_, cpu_norm_, cpu_q_, cpu_k_, cpu_v_, cpu_attn_, cpu_o_, cpu_gate_, cpu_up_, cpu_down_;
-    void forwardCpuLayers(int pos);
-    void cpuLayer(int layer_idx, int pos);
+    std::unique_ptr<friday::CpuLayerRunner> cpu_runner_;  // layers num_gpu_resident_layers_ .. num_layers_ - 1
+    half* h_act_pinned_ = nullptr;                         // hidden state staging for GPU <-> CPU hand-off
 
     // ============================================================
     // V32: Esnek Hibrit Bellek (Elastic Tiered Memory)
@@ -191,7 +168,7 @@ private:
     bool slot_events_created_ = false;
 
     size_t layer_buffer_size_ = 0;
-    std::vector<LayerInfo> layers_info_;
+    std::vector<LayerInfo>& layers_info_ = layout_.layers;
 
     // Ping-Pong Asenkron Akışları
     cudaStream_t stream_compute_ = nullptr; // Stream 1: GPU Hesaplama

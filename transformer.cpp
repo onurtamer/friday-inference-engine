@@ -434,32 +434,23 @@ Transformer::Transformer(
 
     // 2a. CPU-offload mode: keep the remaining layers in host RAM and compute them on the CPU.
     if (cpu_offload_ && num_streamed > 0) {
-        h_cpu_layers_.resize(num_streamed);
-        for (int i = 0; i < num_streamed; ++i) {
-            const auto& l_info = layers_info_[num_gpu_resident_layers_ + i];
-            h_cpu_layers_[i].reset(new unsigned char[l_info.size_bytes]);
-            if (!readLayer(num_gpu_resident_layers_ + i, h_cpu_layers_[i].get())) {
-                throw std::runtime_error("Failed to read layer " + std::to_string(num_gpu_resident_layers_ + i));
-            }
-        }
-        const int kv_dim = num_kv_heads_ * head_dim_;
-        cpu_k_cache_.assign((size_t)num_streamed * max_ctx_ * kv_dim, 0.0f);
-        cpu_v_cache_.assign((size_t)num_streamed * max_ctx_ * kv_dim, 0.0f);
+        friday::CpuModelParams cp;
+        cp.hidden_dim = hidden_dim_;
+        cp.num_heads = num_heads_;
+        cp.num_kv_heads = num_kv_heads_;
+        cp.head_dim = head_dim_;
+        cp.max_ffn_dim = max_intermediate_size_;
+        cp.rms_norm_epsilon = rms_norm_epsilon_;
+        cp.rope_freq_base = rope_freq_base_;
+        cp.rope_neox = rope_neox_;
+        cp.rope_freqs = h_rope_freqs_;
+        cp.max_ctx = max_ctx_;
+        cpu_runner_.reset(new friday::CpuLayerRunner(layout_, *async_io_manager_ptr_, cp, num_gpu_resident_layers_,
+                                                     num_layers_, cpu_threads));
         CUDA_CHECK(cudaMallocHost((void**)&h_act_pinned_, hidden_dim_ * sizeof(half)));
-        cpu_x_.resize(hidden_dim_); cpu_norm_.resize(hidden_dim_); cpu_q_.resize(hidden_dim_);
-        cpu_k_.resize(kv_dim); cpu_v_.resize(kv_dim); cpu_attn_.resize(hidden_dim_); cpu_o_.resize(hidden_dim_);
-        cpu_gate_.resize(max_intermediate_size_); cpu_up_.resize(max_intermediate_size_); cpu_down_.resize(hidden_dim_);
-        if (cpu_threads <= 0) {
-            const unsigned hw = std::thread::hardware_concurrency();
-            // Measured on a 6-core/12-thread Ryzen 5600X: 8 threads read ~34 GB/s
-            // (6: ~29, 12: ~33). Default to 2/3 of the logical CPUs.
-            cpu_threads = hw >= 3 ? (int)(hw * 2 / 3) : 1;
-        }
-        cpu_pool_.reset(new friday_cpu::ThreadPool(cpu_threads));
         printf("[Transformer] %d layers in host RAM (%.2f GB), computed on the CPU with %d threads (%s)\n",
-               num_streamed,
-               [&] { size_t b = 0; for (int l = num_gpu_resident_layers_; l < num_layers_; ++l) b += layers_info_[l].size_bytes; return (double)b / (1u << 30); }(),
-               cpu_pool_->size(), friday_cpu::hasAvx2() ? "AVX2" : "scalar");
+               num_streamed, (double)cpu_runner_->weightBytes() / (1u << 30), cpu_runner_->threads(),
+               friday_cpu::hasAvx2() ? "AVX2" : "scalar");
     }
 
     // 2b. Stream mode: DMA slots and pinned host cache for the streamed layers.
@@ -550,30 +541,7 @@ Transformer::~Transformer() {
 }
 
 void Transformer::loadTensorMap(const std::string& map_path) {
-    printf("[Transformer] '%s' dosyasindan tensor haritasi yukleniyor...\n", map_path.c_str());
-    std::ifstream f(map_path);
-    if (!f.is_open()) {
-        fprintf(stderr, "Hata: Tensor haritasi dosyasi acilamadi: %s\n", map_path.c_str());
-        exit(EXIT_FAILURE);
-    }
-
-    try {
-        nlohmann::json j = nlohmann::json::parse(f);
-        for (const auto& item : j) {
-            TensorInfo info;
-            info.name = item.at("name").get<std::string>();
-            info.absolute_offset = item.at("absolute_offset").get<size_t>();
-            info.size_bytes = item.at("size_bytes").get<size_t>();
-            info.shape = item.at("shape").get<std::vector<long long>>();
-            info.dtype = item.at("dtype").get<std::string>();
-            full_tensor_map_[info.name] = info;
-        }
-        printf("[Transformer] %zu adet tensor bilgisi yuklendi.\n", full_tensor_map_.size());
-    } catch (const nlohmann::json::exception& e) {
-        fprintf(stderr, "Hata: Tensor haritasi JSON ayristirma hatasi: %s\n", e.what());
-        exit(EXIT_FAILURE);
-    }
-    f.close();
+    layout_.loadTensorMap(map_path);
 }
 
 void Transformer::loadTensorsFromGguf(const std::string& gguf_path) {
@@ -581,78 +549,17 @@ void Transformer::loadTensorsFromGguf(const std::string& gguf_path) {
     const friday::ModelConfig cfg = friday::ModelConfig::fromGguf(g);
     rope_freq_base_ = cfg.rope_freq_base;
     rope_neox_ = cfg.ropeNeox();
-    for (const auto& t : g.tensors()) {
-        const char* type_name = friday::ggmlTypeName(t.type);
-        TensorInfo info;
-        info.name = t.name;
-        info.absolute_offset = (size_t)t.offset;
-        info.size_bytes = (size_t)t.size;
-        info.shape.assign(t.ne.begin(), t.ne.end());
-        info.dtype = type_name ? type_name : "UNKNOWN";
-        full_tensor_map_[info.name] = info;
-    }
-    printf("[Transformer] %zu tensors from GGUF v%u '%s'\n", full_tensor_map_.size(), g.version(), gguf_path.c_str());
+    layout_.loadGguf(g);
 }
 
-// Groups blk.<l>.* tensors into one packed buffer per layer. Tensors are copied
-// one by one (GGUF does not guarantee that a layer's tensors are contiguous in
-// the file), each at a 256-byte aligned offset inside the layer buffer.
 void Transformer::buildLayerMap() {
-    layers_info_.resize(num_layers_);
-    std::vector<std::vector<TensorInfo>> layer_tensors(num_layers_);
-
-    for (const auto& [name, info] : full_tensor_map_) {
-        if (name.rfind("blk.", 0) == 0) {
-            size_t dot1 = name.find('.');
-            size_t dot2 = name.find('.', dot1 + 1);
-            if (dot1 != std::string::npos && dot2 != std::string::npos) {
-                int l_idx = std::stoi(name.substr(dot1 + 1, dot2 - dot1 - 1));
-                if (l_idx >= 0 && l_idx < num_layers_) {
-                    layer_tensors[l_idx].push_back(info);
-                }
-            }
-        }
-    }
-
-    size_t max_layer_size = 0;
-    for (int l = 0; l < num_layers_; ++l) {
-        if (layer_tensors[l].empty()) {
-            fprintf(stderr, "Hata: Katman %d icin tensor bulunamadi!\n", l);
-            exit(EXIT_FAILURE);
-        }
-        auto& lt = layer_tensors[l];
-        std::sort(lt.begin(), lt.end(), [](const TensorInfo& a, const TensorInfo& b) {
-            return a.absolute_offset < b.absolute_offset;
-        });
-        size_t cur = 0;
-        for (const auto& t : lt) {
-            cur = (cur + 255) / 256 * 256;
-            layers_info_[l].chunks.push_back({t.absolute_offset, t.size_bytes, cur});
-            layers_info_[l].tensor_rel_offsets[t.name] = cur;
-            cur += t.size_bytes;
-        }
-        layers_info_[l].size_bytes = cur;
-        if (layers_info_[l].size_bytes > max_layer_size) {
-            max_layer_size = layers_info_[l].size_bytes;
-        }
-    }
-
-    printf("[Transformer] Katman haritasi olusturuldu: %d katman, Max katman boyutu: %zu bayt (%.2f MB)\n",
-           num_layers_, max_layer_size, (float)max_layer_size / (1024.0f * 1024.0f));
-
-    size_t aligned_max = ((max_layer_size + 1048575) / 1048576) * 1048576;
+    layout_.buildLayers(num_layers_);
+    const size_t aligned_max = ((layout_.max_layer_bytes + 1048575) / 1048576) * 1048576;
     layer_buffer_size_ = std::max((size_t)(32 * 1024 * 1024), aligned_max);
 }
 
 bool Transformer::readLayer(int layer_idx, unsigned char* dst) {
-    const auto& li = layers_info_[layer_idx];
-    size_t filled = 0;
-    for (const auto& c : li.chunks) {
-        if (c.rel_offset > filled) std::memset(dst + filled, 0, c.rel_offset - filled);  // alignment padding
-        if (!async_io_manager_ptr_->readLayerToHost(c.file_offset, c.size, dst + c.rel_offset)) return false;
-        filled = c.rel_offset + c.size;
-    }
-    return true;
+    return layout_.readLayer(*async_io_manager_ptr_, layer_idx, dst);
 }
 
 void Transformer::applyRMSNorm(
@@ -1055,11 +962,12 @@ void Transformer::forward(
         CUDA_CHECK(cudaMemcpyAsync(h_act_pinned_, d_input_activations, hidden_dim_ * sizeof(half),
                                    cudaMemcpyDeviceToHost, compute_stream));
         CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        float* x = cpu_runner_->hidden();
         const uint16_t* hb = reinterpret_cast<const uint16_t*>(h_act_pinned_);
-        for (int i = 0; i < hidden_dim_; ++i) cpu_x_[i] = friday_cpu::halfToFloat(hb[i]);
-        forwardCpuLayers(pos_offset);
+        for (int i = 0; i < hidden_dim_; ++i) x[i] = friday_cpu::halfToFloat(hb[i]);
+        cpu_runner_->run(pos_offset);
         uint16_t* ho = reinterpret_cast<uint16_t*>(h_act_pinned_);
-        for (int i = 0; i < hidden_dim_; ++i) ho[i] = friday_cpu::floatToHalf(cpu_x_[i]);
+        for (int i = 0; i < hidden_dim_; ++i) ho[i] = friday_cpu::floatToHalf(x[i]);
         CUDA_CHECK(cudaMemcpyAsync(d_input_activations, h_act_pinned_, hidden_dim_ * sizeof(half),
                                    cudaMemcpyHostToDevice, compute_stream));
     }
@@ -1197,91 +1105,4 @@ void Transformer::forward(
     }
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
-}
-
-// ---------------------------------------------------------------------------
-// CPU-computed layers (CPU-offload mode). Same math as the GPU path: int8
-// activations for the K-quant GEMVs and fp16 rounding at the same points.
-// ---------------------------------------------------------------------------
-void Transformer::forwardCpuLayers(int pos) {
-    for (int l = num_gpu_resident_layers_; l < num_layers_; ++l) cpuLayer(l, pos);
-}
-
-void Transformer::cpuLayer(int layer_idx, int pos) {
-    using namespace friday_cpu;
-    const int ci = layer_idx - num_gpu_resident_layers_;
-    const unsigned char* base = h_cpu_layers_[ci].get();
-    const auto& li = layers_info_[layer_idx];
-    const std::string pre = "blk." + std::to_string(layer_idx) + ".";
-    const int H = hidden_dim_, kv_dim = num_kv_heads_ * head_dim_;
-
-    auto ptr = [&](const char* n) { return base + li.tensor_rel_offsets.at(pre + n); };
-    auto gemv = [&](const char* n, const Q8Activation& xa, float* y) {
-        const TensorInfo& ti = full_tensor_map_.at(pre + n);
-        const int K = (int)ti.shape[0], N = (int)ti.shape[1];
-        KQuant t;
-        if (ti.dtype == "Q2_K") t = KQuant::Q2_K;
-        else if (ti.dtype == "Q3_K") t = KQuant::Q3_K;
-        else if (ti.dtype == "Q4_K") t = KQuant::Q4_K;
-        else if (ti.dtype == "Q6_K") t = KQuant::Q6_K;
-        else if (ti.dtype == "Q5_K") t = KQuant::Q5_K;
-        else if (ti.dtype == "Q8_0") t = KQuant::Q8_0;
-        else throw std::runtime_error("CPU layers: unsupported weight type " + ti.dtype + " for " + pre + n);
-        if (xa.K != K) throw std::runtime_error("CPU layers: shape mismatch for " + pre + n);
-        const uint8_t* W = ptr(n);
-        cpu_pool_->parallelFor(N, 32, [&](int b, int e) { gemvRows(t, W, xa, y, b, e); });
-        roundToHalf(y, N);
-        return N;
-    };
-    auto addBias = [&](const char* n, float* y, int N) {
-        if (!li.tensor_rel_offsets.count(pre + n)) return;
-        const float* b = reinterpret_cast<const float*>(ptr(n));
-        for (int i = 0; i < N; ++i) y[i] += std::isnan(b[i]) ? 0.0f : b[i];
-        roundToHalf(y, N);
-    };
-
-    Q8Activation xa;
-    // Attention block
-    rmsNorm(cpu_x_.data(), reinterpret_cast<const float*>(ptr("attn_norm.weight")), cpu_norm_.data(), H,
-            rms_norm_epsilon_);
-    quantizeActivation(cpu_norm_.data(), H, xa);
-    addBias("attn_q.bias", cpu_q_.data(), gemv("attn_q.weight", xa, cpu_q_.data()));
-    addBias("attn_k.bias", cpu_k_.data(), gemv("attn_k.weight", xa, cpu_k_.data()));
-    addBias("attn_v.bias", cpu_v_.data(), gemv("attn_v.weight", xa, cpu_v_.data()));
-    if (li.tensor_rel_offsets.count(pre + "attn_q_norm.weight") && li.tensor_rel_offsets.count(pre + "attn_k_norm.weight")) {
-        // Qwen3: per-head RMSNorm of Q and K (same math as headRmsNormKernel).
-        const float* wq = reinterpret_cast<const float*>(ptr("attn_q_norm.weight"));
-        const float* wk = reinterpret_cast<const float*>(ptr("attn_k_norm.weight"));
-        std::vector<float> tmp(head_dim_);
-        for (int h = 0; h < num_heads_; ++h) {
-            rmsNorm(cpu_q_.data() + h * head_dim_, wq, tmp.data(), head_dim_, rms_norm_epsilon_);
-            std::memcpy(cpu_q_.data() + h * head_dim_, tmp.data(), head_dim_ * sizeof(float));
-        }
-        for (int h = 0; h < num_kv_heads_; ++h) {
-            rmsNorm(cpu_k_.data() + h * head_dim_, wk, tmp.data(), head_dim_, rms_norm_epsilon_);
-            std::memcpy(cpu_k_.data() + h * head_dim_, tmp.data(), head_dim_ * sizeof(float));
-        }
-    }
-    rope(cpu_q_.data(), cpu_k_.data(), head_dim_, num_heads_, num_kv_heads_, pos, rope_freq_base_, rope_neox_,
-         h_rope_freqs_.empty() ? nullptr : h_rope_freqs_.data());
-    float* k_layer = cpu_k_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;
-    float* v_layer = cpu_v_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;
-    std::memcpy(k_layer + (size_t)pos * kv_dim, cpu_k_.data(), kv_dim * sizeof(float));
-    std::memcpy(v_layer + (size_t)pos * kv_dim, cpu_v_.data(), kv_dim * sizeof(float));
-    decodeAttention(cpu_q_.data(), k_layer, v_layer, cpu_attn_.data(), pos + 1, num_heads_, num_kv_heads_,
-                    head_dim_, *cpu_pool_);
-    quantizeActivation(cpu_attn_.data(), H, xa);
-    gemv("attn_output.weight", xa, cpu_o_.data());
-    addResidual(cpu_x_.data(), cpu_o_.data(), H);
-
-    // MLP block (SwiGLU)
-    rmsNorm(cpu_x_.data(), reinterpret_cast<const float*>(ptr("ffn_norm.weight")), cpu_norm_.data(), H,
-            rms_norm_epsilon_);
-    quantizeActivation(cpu_norm_.data(), H, xa);
-    const int I = gemv("ffn_gate.weight", xa, cpu_gate_.data());
-    gemv("ffn_up.weight", xa, cpu_up_.data());
-    siluMul(cpu_gate_.data(), cpu_up_.data(), I);
-    quantizeActivation(cpu_gate_.data(), I, xa);
-    gemv("ffn_down.weight", xa, cpu_down_.data());
-    addResidual(cpu_x_.data(), cpu_down_.data(), H);
 }

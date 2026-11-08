@@ -5,10 +5,13 @@
 #           Run before merging any change that may affect numerics.
 # Examples:  ctest -L unit     ctest -L gpu     ctest -L model
 
+# Host test programs: compiled like main.cpp (nvcc in CUDA builds for the device link).
 function(friday_test_target name)
-    set_source_files_properties(${ARGN} PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(${ARGN} PROPERTIES LANGUAGE ${FRIDAY_HOST_LANGUAGE})
     add_executable(${name} ${ARGN})
-    set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    if(FRIDAY_ENABLE_CUDA)
+        set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    endif()
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(${name} PRIVATE friday_engine)
 endfunction()
@@ -25,9 +28,11 @@ add_test(NAME tokenizer_pretokenize
 set_tests_properties(tokenizer_pretokenize PROPERTIES LABELS "unit")
 
 # --- gpu --------------------------------------------------------------------
-friday_test_target(test_decode_attention kernels/test_decode_attention.cu)
-add_test(NAME decode_attention COMMAND test_decode_attention)
-set_tests_properties(decode_attention PROPERTIES LABELS "gpu")
+if(FRIDAY_ENABLE_CUDA)
+    friday_test_target(test_decode_attention kernels/test_decode_attention.cu)
+    add_test(NAME decode_attention COMMAND test_decode_attention)
+    set_tests_properties(decode_attention PROPERTIES LABELS "gpu")
+endif()
 
 find_package(Python3 COMPONENTS Interpreter)
 set(FRIDAY_HAVE_GGUF_PY FALSE)
@@ -43,11 +48,13 @@ if(FRIDAY_HAVE_GGUF_PY)
     set(_fx ${CMAKE_CURRENT_BINARY_DIR}/kquant_fixtures)
     add_test(NAME kquant_fixtures
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/kernels/make_fixtures.py ${_fx})
-    set_tests_properties(kquant_fixtures PROPERTIES LABELS "gpu" FIXTURES_SETUP kquant)
+    set_tests_properties(kquant_fixtures PROPERTIES LABELS "unit" FIXTURES_SETUP kquant)
 
-    friday_test_target(test_kquant_kernels kernels/test_kquant_kernels.cu)
-    add_test(NAME kquant_kernels COMMAND test_kquant_kernels ${_fx})
-    set_tests_properties(kquant_kernels PROPERTIES LABELS "gpu" FIXTURES_REQUIRED kquant)
+    if(FRIDAY_ENABLE_CUDA)
+        friday_test_target(test_kquant_kernels kernels/test_kquant_kernels.cu)
+        add_test(NAME kquant_kernels COMMAND test_kquant_kernels ${_fx})
+        set_tests_properties(kquant_kernels PROPERTIES LABELS "gpu" FIXTURES_REQUIRED kquant)
+    endif()
 
     set(_gx ${CMAKE_CURRENT_BINARY_DIR}/gguf_fixtures)
     add_test(NAME gguf_fixtures
@@ -62,7 +69,7 @@ if(FRIDAY_HAVE_GGUF_PY)
 
     friday_test_target(test_cpu_kquants kernels/test_cpu_kquants.cpp)
     add_test(NAME cpu_kquants COMMAND test_cpu_kquants ${_fx})
-    set_tests_properties(cpu_kquants PROPERTIES LABELS "gpu" FIXTURES_REQUIRED kquant)
+    set_tests_properties(cpu_kquants PROPERTIES LABELS "unit" FIXTURES_REQUIRED kquant)
 else()
     message(STATUS "FRIDAY tests: Python 'gguf' + 'numpy' not found; GPU kernel tests disabled")
 endif()
@@ -72,7 +79,10 @@ set(FRIDAY_MODEL_DIR "" CACHE PATH
     "Directory with friday_aligned_int4.bin, tensor_map.json, tokenizer_config.json (enables model tests)")
 friday_test_target(golden_check model/golden_check.cpp)
 friday_test_target(test_tokenizer_qwen model/test_tokenizer_qwen.cpp)
-if(FRIDAY_MODEL_DIR)
+# Qwen2.5-32B needs ~13 GB of host RAM when run fully on the CPU; in CPU-only
+# builds its tests are opt-in.
+option(FRIDAY_BIG_CPU_TESTS "CPU-only build: also run the 32B model tests" OFF)
+if(FRIDAY_MODEL_DIR AND (FRIDAY_ENABLE_CUDA OR FRIDAY_BIG_CPU_TESTS))
     set(_gguf ${FRIDAY_MODEL_DIR}/Qwen2.5-32B-Instruct-Q2_K.gguf)
     if(EXISTS ${_gguf})
         # CPU only: tokenizer from the GGUF metadata vs. reference Qwen2 tokenizer ids.

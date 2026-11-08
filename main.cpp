@@ -13,15 +13,15 @@
 #include <string>
 #include <fstream>
 #include <exception> // Hatalari yakalamak icin eklendi
-#include "transformer.h"
+#include "engine.h"
+#include "system_info.h"
 #include "gguf_file.h"
 #include "model_config.h"
 #include "model_registry.h"
 #include <cstdio>
 #include <memory>
-#include "io_manager.h"
 #include "tokenizer.h"
-#include "kernel_dispatcher.h"
+#include <cmath>
 #include <nlohmann/json.hpp>
 
 // V32: Modelden üretilen token string'e ekrana basılmadan hemen önce uygulanan temizleme filtresi
@@ -76,15 +76,6 @@ static std::string cleanTokenString(std::string text) {
     return text;
 }
 
-QuantType stringToQuantType(const std::string& type_str) {
-    if (type_str == "F16" || type_str == "F32") return FP16;
-    if (type_str == "Q4_0" || type_str == "Q4_K") return INT4;
-    if (type_str == "Q4_1") return Q4_1;
-    if (type_str == "Q8_0" || type_str == "Q8_1") return INT8;
-    if (type_str == "Q6_K") return Q6_K;
-    if (type_str == "TERNARY") return TERNARY;
-    return UNKNOWN;
-}
 
 void createDefaultTokenizerConfigIfNeeded(const std::string& path) {
     std::ifstream f(path);
@@ -95,29 +86,17 @@ void createDefaultTokenizerConfigIfNeeded(const std::string& path) {
     }
 }
 
-int argmaxFromDeviceLogits(const half* d_logits, int vocab_size, cudaStream_t stream) {
-    std::vector<half> h_logits(vocab_size);
-    cudaMemcpyAsync(h_logits.data(), d_logits, vocab_size * sizeof(half), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    
+// Greedy selection: skip NaN/Inf, first maximum wins.
+static int argmaxLogits(const std::vector<float>& logits) {
     int max_idx = -1;
     float max_val = -1e30f;
     int nan_count = 0;
-    for (int i = 0; i < vocab_size; ++i) {
-        float val = __half2float(h_logits[i]);
-        if (std::isnan(val) || std::isinf(val)) {
-            nan_count++;
-            continue;
-        }
-        if (val > max_val) {
-            max_val = val;
-            max_idx = i;
-        }
+    for (int i = 0; i < (int)logits.size(); ++i) {
+        const float val = logits[i];
+        if (std::isnan(val) || std::isinf(val)) { nan_count++; continue; }
+        if (val > max_val) { max_val = val; max_idx = i; }
     }
-    if (max_idx < 0) {
-        std::cerr << "\n[CRITICAL] All " << vocab_size << " logits are NaN/Inf! (" << nan_count << " NaNs)\n";
-        return 151643;
-    }
+    if (max_idx < 0) std::cerr << "\n[CRITICAL] All " << logits.size() << " logits are NaN/Inf! (" << nan_count << " NaNs)\n";
     return max_idx;
 }
 
@@ -163,6 +142,26 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+    if (argc >= 2 && (std::string(argv[1]) == "--info" || std::string(argv[1]) == "info")) {
+        const friday::CpuInfo c = friday::cpuInfo();
+        const friday::MemoryInfo m = friday::memoryInfo();
+        std::cout << "FRIDAY Engine capability report\n";
+        std::cout << "  CPU      : " << (c.brand.empty() ? "?" : c.brand) << " (" << c.arch << ", " << c.logical_cpus
+                  << " logical CPUs)\n  features :";
+        for (const auto& f : c.features) std::cout << " " << f;
+        std::cout << "\n  CPU GEMV : " << c.cpu_kernels << " kernels\n";
+        std::printf("  RAM      : %.1f GB total, %.1f GB available\n", m.total_bytes / 1e9, m.available_bytes / 1e9);
+        std::cout << "  CUDA     : " << (friday::Engine::cudaCompiledIn() ? "compiled in" : "not in this build") << "\n";
+        for (const auto& g : friday::Engine::gpuInfo()) {
+            std::printf("  GPU      : %s, compute %d.%d, %d SMs, %.1f GB VRAM (%.1f GB free)", g.name.c_str(),
+                        g.compute_major, g.compute_minor, g.multiprocessors, g.total_bytes / 1e9, g.free_bytes / 1e9);
+            if (g.pcie_gen_max) std::printf(", PCIe gen %d x%d (max link)", g.pcie_gen_max, g.pcie_width_max);
+            std::printf("\n");
+        }
+        std::cout << "  Backend  : " << (friday::Engine::gpuInfo().empty() ? "CPU (all layers)" : "CUDA + CPU for layers that do not fit in VRAM")
+                  << " (override: --backend cpu|cuda)\n";
+        return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "models") {
         try { return runModelsCommand(argc, argv); }
         catch (const std::exception& e) { std::cerr << "Error: " << e.what() << "\n"; return 1; }
@@ -178,6 +177,7 @@ int main(int argc, char** argv) {
         double vram_limit_gb = 0.0; // 0.0 = Otomatik algilama
         int max_context = 2048;      // --ctx N: KV cache capacity in tokens (GPU memory)
         int cpu_threads = 0;         // --threads N: CPU threads for CPU-computed layers (0 = auto)
+        friday::BackendKind backend = friday::BackendKind::Auto;  // --backend auto|cuda|cpu
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -187,6 +187,12 @@ int main(int argc, char** argv) {
                 max_context = std::stoi(argv[++i]);
             } else if (arg == "--threads" && i + 1 < argc) {
                 cpu_threads = std::stoi(argv[++i]);
+            } else if (arg == "--backend" && i + 1 < argc) {
+                const std::string b = argv[++i];
+                if (b == "cpu") backend = friday::BackendKind::Cpu;
+                else if (b == "cuda") backend = friday::BackendKind::Cuda;
+                else if (b == "auto") backend = friday::BackendKind::Auto;
+                else { std::cerr << "unknown --backend '" << b << "' (auto, cuda, cpu)\n"; return 2; }
             } else if (arg.rfind("--", 0) != 0) {
                 // Sayısal değer ise vram limiti, değilse model dosyasıdır
                 try {
@@ -227,7 +233,7 @@ int main(int argc, char** argv) {
         int num_kv_heads = 0;
         int num_layers = 0;
         float rms_norm_epsilon = 0.0f;
-        QuantType model_quant_type = UNKNOWN;
+        std::string model_quant_type;
         std::unique_ptr<Tokenizer> tokenizer_ptr;
 
         if (is_gguf) {
@@ -261,56 +267,32 @@ int main(int argc, char** argv) {
             num_kv_heads = j.at("num_kv_heads").get<int>();
             num_layers = j.at("num_layers").get<int>();
             rms_norm_epsilon = j.at("rms_norm_epsilon").get<float>();
-            model_quant_type = stringToQuantType(j.at("quant_type").get<std::string>());
+            model_quant_type = j.at("quant_type").get<std::string>();
             params_file.close();
         }
         Tokenizer& tokenizer = *tokenizer_ptr;
-        AsyncIOManager async_io_manager(gguf_model_path);
+        friday::EngineOptions eo;
+        eo.model_path = gguf_model_path;
+        eo.vram_gb = vram_limit_gb;
+        eo.max_ctx = max_context;
+        eo.cpu_threads = cpu_threads;
+        eo.backend = backend;
+        eo.tensor_map = "tensor_map.json";  // deprecated .bin path only
+        eo.hidden_dim = hidden_dim;
+        eo.num_heads = num_heads;
+        eo.num_kv_heads = num_kv_heads;
+        eo.num_layers = num_layers;
+        eo.rms_norm_epsilon = rms_norm_epsilon;
+        eo.quant_type = model_quant_type;
+        friday::Engine engine(eo);
 
-        std::string tensor_map_file = "tensor_map.json";
-
-        std::cout << "[Init] Allocating GPU device memory for activation buffers...\n" << std::flush;
-
-        Transformer transformer(
-            gguf_model_path,
-            tensor_map_file,
-            hidden_dim,
-            num_heads,
-            num_kv_heads,
-            num_layers,
-            rms_norm_epsilon,
-            model_quant_type,
-            &async_io_manager,
-            vram_limit_gb,
-            max_context,
-            cpu_threads
-        );
-
-        int vocab_size = transformer.getVocabSize();
-        if (vocab_size == 0) {
-            vocab_size = tokenizer.getVocabSize();
-        }
-
-        if (vocab_size == 0) {
-            fprintf(stderr, "Hata: vocab_size belirlenemedi.\n");
-            return 1;
-        }
-        
+        const int vocab_size = engine.vocabSize();
         int eos_token_id = tokenizer.getEosTokenId();
         if (eos_token_id == -1) eos_token_id = 151645; // Qwen <|im_end|>
-        
-        printf("[Init] Determined vocab_size: %d, eos_token_id: %d\n", vocab_size, eos_token_id);
-        fflush(stdout);
+        printf("[Init] vocab_size: %d, eos_token_id: %d\n", vocab_size, eos_token_id);
+        std::vector<float> logits(vocab_size);
 
-        half *d_output_logits = nullptr;
-        CUDA_CHECK(cudaMalloc((void**)&d_output_logits, vocab_size * sizeof(half)));
-        CUDA_CHECK(cudaMemset(d_output_logits, 0, vocab_size * sizeof(half)));
-
-        half* d_input_activations = nullptr;
-        CUDA_CHECK(cudaMalloc((void**)&d_input_activations, hidden_dim * sizeof(half)));
-        CUDA_CHECK(cudaMemset(d_input_activations, 0, hidden_dim * sizeof(half)));
-
-        std::cout << "[Init] FRIDAY Engine 2.0 (V32 - Elastic Tiered Memory & 14B) basariyla hazirlandi.\n";
+        std::cout << "[Init] FRIDAY Engine ready.\n";
         std::cout << "Sisteme soru sorabilirsiniz (Cikmak icin 'exit' veya 'quit' yazin):\n";
         std::cout << std::flush;
 
@@ -321,80 +303,36 @@ int main(int argc, char** argv) {
             if (prompt == "exit" || prompt == "quit") break;
             if (prompt.empty()) continue;
 
-            cudaStream_t stream;
-            CUDA_CHECK(cudaStreamCreate(&stream));
-
-            // Apply Qwen ChatML template before encoding
-            std::string templated_prompt = tokenizer.applyChatTemplate(prompt);
-            std::vector<int> input_tokens = tokenizer.encode(templated_prompt);
+            // Each prompt starts a new sequence (multi-turn chat comes with roadmap R6).
+            std::vector<int> input_tokens = tokenizer.encode(tokenizer.applyChatTemplate(prompt));
             if (tokenizer.addsBos()) input_tokens.insert(input_tokens.begin(), tokenizer.getBosTokenId());
-            std::cout << "[Tokenizer] Prompt ChatML formatinda islendi (" << input_tokens.size() << " token).\n";
-
-            if (input_tokens.empty()) {
-                CUDA_CHECK(cudaStreamDestroy(stream));
+            std::cout << "[Tokenizer] " << input_tokens.size() << " prompt tokens.\n";
+            if (input_tokens.empty()) continue;
+            if ((int)input_tokens.size() >= engine.maxContext()) {
+                std::cerr << "[Hata] Prompt is longer than the context (" << engine.maxContext() << "); use --ctx.\n";
                 continue;
             }
 
-            std::cout << "[Inference] Cevap uretiliyor...\n" << std::flush;
+            try {
+                for (size_t i = 0; i < input_tokens.size(); ++i) engine.step(input_tokens[i], (int)i, logits.data());
+                int next_token_id = argmaxLogits(logits);
 
-            bool prefill_success = true;
-            // Prefill Phase: tum prompt tokenlarini isleyelim
-            for (size_t i = 0; i < input_tokens.size(); ++i) {
-                int current_token = input_tokens[i];
-                
-                if (!transformer.getEmbedding(current_token, d_input_activations, vocab_size, stream)) {
-                    fprintf(stderr, "\n[Hata] Token %d icin embedding alinamadi. Durduruluyor...\n", current_token);
-                    prefill_success = false;
-                    break;
+                const int max_new_tokens = 100;
+                std::cout << "\nFRIDAY: " << std::flush;
+                for (int step = 0; step < max_new_tokens && next_token_id >= 0; ++step) {
+                    if (next_token_id == eos_token_id || next_token_id == 151643 || next_token_id == 151645) break;
+                    std::cout << cleanTokenString(tokenizer.decode({next_token_id})) << std::flush;
+                    input_tokens.push_back(next_token_id);
+                    const int current_pos = (int)input_tokens.size() - 1;
+                    if (current_pos >= engine.maxContext()) { std::cerr << "\n[context full]"; break; }
+                    engine.step(next_token_id, current_pos, logits.data());
+                    next_token_id = argmaxLogits(logits);
                 }
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-
-                CUDA_CHECK(cudaMemsetAsync(d_output_logits, 0, vocab_size * sizeof(half), stream));
-                transformer.forward(d_input_activations, d_output_logits, 1, 0, (int)i, stream);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+            } catch (const std::exception& e) {
+                std::cerr << "\n[Hata] " << e.what() << "\n";
             }
-
-            if (!prefill_success) {
-                CUDA_CHECK(cudaStreamDestroy(stream));
-                continue;
-            }
-
-            int next_token_id = argmaxFromDeviceLogits(d_output_logits, vocab_size, stream);
-
-            // Auto-regressive Generation Loop with Live Streaming
-            const int max_new_tokens = 100;
-            std::cout << "\nFRIDAY: " << std::flush;
-
-            for (int step = 0; step < max_new_tokens; ++step) {
-                if (next_token_id == eos_token_id || next_token_id == 151643 || next_token_id == 151645) {
-                    break;
-                }
-
-                std::string token_text = cleanTokenString(tokenizer.decode({next_token_id}));
-                std::cout << token_text << std::flush;
-                input_tokens.push_back(next_token_id);
-
-                if (!transformer.getEmbedding(next_token_id, d_input_activations, vocab_size, stream)) {
-                    fprintf(stderr, "\n[Hata] Token %d icin embedding alinamadi. Durduruluyor...\n", next_token_id);
-                    break;
-                }
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-
-                int current_pos = (int)input_tokens.size() - 1;
-                CUDA_CHECK(cudaMemsetAsync(d_output_logits, 0, vocab_size * sizeof(half), stream));
-                transformer.forward(d_input_activations, d_output_logits, 1, 0, current_pos, stream);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-
-                next_token_id = argmaxFromDeviceLogits(d_output_logits, vocab_size, stream);
-            }
-
             std::cout << "\n" << std::flush;
-            CUDA_CHECK(cudaStreamDestroy(stream));
         }
-
-        std::cout << "[Cleanup] Freeing GPU activation buffers...\n";
-        CUDA_CHECK(cudaFree(d_input_activations));
-        CUDA_CHECK(cudaFree(d_output_logits));
 
         std::cout << "[Shutdown] FRIDAY Engine 2.0 successfully shut down.\n";
         return 0;

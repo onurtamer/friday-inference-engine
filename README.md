@@ -60,6 +60,7 @@ flowchart TD
 ### 1. 🧠 Elastic Tiered Memory (ETM) Architecture
 - **Dynamic VRAM Sizing (`--vram <gb>`):** The engine probes total and available physical VRAM dynamically (or obeys a user-specified limit such as `--vram 6.0`).
 - **GPU layers first:** the LM head and output norm stay in VRAM; then as many transformer layers as fit, each charged with its share of the GPU KV cache (`--ctx`). The embedding table lives in host RAM (one row is uploaded per token).
+- **Backends:** `friday::Engine` (engine.h) is the only API the CLI and tests use; it hides device memory. The CUDA backend (`Transformer`) runs the GPU layers and hands the rest to the CPU backend (`CpuLayerRunner`), which can also run a whole model, embedding and LM head included, when there is no GPU or with `--backend cpu`.
 - **CPU layers:** the remaining layers are loaded into host RAM at startup and computed on the CPU (`--threads`, default 2/3 of the logical CPUs). Only the 10 KB hidden state crosses PCIe, twice per token. No disk I/O occurs during generation.
 - **Why not stream weights over PCIe?** Measured on the dev box: PCIe 3.0 x16 moves ~13 GB/s, the CPU reads host RAM at ~38 GB/s, so computing a non-resident layer on the CPU (~6 ms) beats copying it to the GPU every token (~13 ms). The previous streaming mode (DMA slots, two CUDA streams) is still available with `FRIDAY_OFFLOAD=stream`.
 
@@ -162,6 +163,13 @@ cmake --build build --config Release
 ```
 *The compiled binary will be located at `build/Release/FridayEngine.exe`.*
 
+CPU-only build (no CUDA toolkit needed; runs the whole model on the CPU):
+```bash
+cmake -B build-cpu -A x64 -DFRIDAY_ENABLE_CUDA=OFF
+cmake --build build-cpu --config Release
+```
+`FridayEngine --info` prints what the machine offers (CPU features, RAM, CUDA devices with VRAM and PCIe link) and which backend will be used.
+
 ### Step 4: Run Inference
 Launch the engine with your preferred VRAM allocation:
 ```bash
@@ -191,6 +199,8 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | `--vram` | `<float>` | Maximum GPU VRAM to allocate for weights and buffers (in GB). | `0.0` (Auto-detect free VRAM) |
 | `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). GPU layers keep it in VRAM (fp16, 4 KiB per token per layer for Qwen2.5-32B), CPU layers in host RAM. | `2048` |
 | `--threads` | `<int>` | CPU threads for the CPU-computed layers. | `0` (2/3 of the logical CPUs) |
+| `--backend` | `auto` / `cuda` / `cpu` | `cpu` runs every layer, the embedding and the LM head on the CPU. `FRIDAY_BACKEND` sets the same for tools such as the golden test. | `auto` (CUDA if a device is present) |
+| `--info` | | Capability report, then exit. | |
 | `<model_path>`| `<string>` | Path to the `.gguf` model file, or the id of a registered model (a converted `.bin` is still accepted, deprecated). | `friday_aligned_int4.bin` |
 
 ### Model registry

@@ -59,6 +59,20 @@ recorded, docs updated, commit reviewed.
         20/20 vs. llama-tokenize; golden vs. llama.cpp for Qwen3-8B Q4_K_M
         (all-GPU and 9 GPU / 27 CPU layers): 32/32, max top-1 diff 0.019.
         Mistral (needs a SentencePiece tokenizer) moved to after R3 (2026-11-08).
+- **R3 — in progress.**
+  - [x] Backend split: `friday::Engine` API (host logits, no device memory in
+        callers); `ModelLayout` (tensors + packed layers) and `CpuLayerRunner`
+        shared by both backends; `io_manager` CUDA-free. CUDA path bit-identical
+        to before (Qwen2.5 57/7, Qwen3 9/27, Llama 9/23 GPU/CPU layers).
+  - [x] CPU-only engine: embedding, layers and LM head on the CPU
+        (`--backend cpu` / `FRIDAY_BACKEND=cpu`); CPU-only build with
+        `-DFRIDAY_ENABLE_CUDA=OFF` (no CUDA DLLs). Golden vs. llama.cpp on the
+        CPU: Llama 3.1 8B (max diff 0.052) and Qwen3 8B (0.020), ~6.9 tok/s.
+  - [x] Capability report `FridayEngine --info` (CPU features, RAM, CUDA devices,
+        VRAM, PCIe link via NVML loaded at run time).
+  - [ ] Linux build and tests (x86-64, WSL): needs a toolchain in WSL.
+  - [ ] ARM64: NEON kernels, cross-compile, QEMU and real-device tests —
+        deferred to the end of R3 (no ARM device yet; Raspberry Pi as interim).
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).

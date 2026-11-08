@@ -36,62 +36,6 @@ AsyncIOManager::~AsyncIOManager() {
     printf("[AsyncIOManager] Kapatiliyor.\n");
 }
 
-void AsyncIOManager::enqueueReadExpertWeights(
-    int expert_id,
-    size_t file_absolute_offset,
-    size_t requested_size_bytes,
-    unsigned char* d_destination_ptr,
-    cudaStream_t stream)
-{
-    size_t SECTOR_SIZE = 4096; 
-
-    size_t aligned_offset = file_absolute_offset - (file_absolute_offset % SECTOR_SIZE);
-    size_t shift_bytes = file_absolute_offset - aligned_offset;
-    size_t aligned_read_size = ((requested_size_bytes + shift_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
-
-    printf("[AsyncIOManager] Expert %d icin Sektor Kaydirma hesaplamalari:\n", expert_id);
-    printf("  Orijinal Ofset: %zu bayt\n", file_absolute_offset);
-    printf("  Istenen Boyut: %zu bayt\n", requested_size_bytes);
-    printf("  Hizali Ofset: %zu bayt\n", aligned_offset);
-    printf("  Kaydirma (Shift) Miktari: %zu bayt\n", shift_bytes);
-    printf("  Hizali Okuma Boyutu: %zu bayt\n", aligned_read_size);
-
-    printf("[AsyncIOManager] Expert %d icin asenkron okuma kuyruga eklendi. \n"
-           "Mutlak Ofset: %zu, Okunacak Boyut (Hizali): %zu bayt. Hedef: %p\n",
-           expert_id, aligned_offset, aligned_read_size, d_destination_ptr);
-
-    std::ifstream file(model_file_path_, std::ios::binary);
-    if (!file.is_open()) {
-        fprintf(stderr, "Hata: Model dosyasi acilamadi: %s\n", model_file_path_.c_str());
-        exit(EXIT_FAILURE);
-    }
-
-    file.seekg(aligned_offset, std::ios::beg);
-    if (file.fail()) {
-        fprintf(stderr, "Hata: Dosya ofsetine gitme basarisiz oldu (offset: %zu).\n", aligned_offset);
-        file.close();
-        exit(EXIT_FAILURE);
-    }
-
-    std::vector<unsigned char> host_buffer(aligned_read_size);
-
-    file.read(reinterpret_cast<char*>(host_buffer.data()), aligned_read_size);
-    if (file.fail() && !file.eof()) {
-        fprintf(stderr, "Hata: Dosyadan okuma basarisiz oldu (boyut: %zu bayt, ofset: %zu).\n", aligned_read_size, aligned_offset);
-        file.close();
-        exit(EXIT_FAILURE);
-    }
-    file.close();
-
-    CUDA_CHECK(cudaMemcpy(
-        d_destination_ptr,
-        host_buffer.data() + shift_bytes,
-        requested_size_bytes,             
-        cudaMemcpyHostToDevice
-    ));
-
-    printf("[AsyncIOManager] Expert %d icin gercek okuma ve GPU'ya kopyalama tamamlandi.\n", expert_id);
-}
 
 bool AsyncIOManager::readLayerToHost(
     size_t file_absolute_offset,
