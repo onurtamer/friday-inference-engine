@@ -40,18 +40,29 @@ for case, (qtype, bb, offs) in LAYOUT.items():
     deq = quants.dequantize(w, qtype).astype(np.float64).reshape(N, K)
     x = rng.standard_normal(K).astype(np.float16)
     (deq @ x.astype(np.float64)).tofile(os.path.join(out, case + "_yref.bin"))
+    # Reference with the int8 activation used by the engine's dp4a GEMV:
+    # blocks of 32, d = amax / 127 (fp32), q = round-half-even(x * (1 / d)).
+    xb = x.astype(np.float32).reshape(-1, 32)
+    d = (np.abs(xb).max(axis=1) / np.float32(127)).astype(np.float32)
+    inv = np.where(d > 0, np.float32(1) / np.where(d > 0, d, 1), 0).astype(np.float32)
+    q = np.clip(np.rint(xb * inv[:, None]), -127, 127)
+    xq8 = (q.astype(np.float64) * d.astype(np.float64)[:, None]).reshape(K)
+    (deq @ xq8).tofile(os.path.join(out, case + "_yref_q8.bin"))
     w.tofile(os.path.join(out, case + "_w.bin"))
     x.tofile(os.path.join(out, case + "_x.bin"))
     meta.append({"case": case, "K": K, "N": N})
 
 # Q2_K embedding table: dequantize selected rows.
+# Embedding tables: dequantize selected rows, for every K-quant type.
 V, D = 32, 1024
-table = random_rows(84, [80, 82], V, D // 256)
 ids = [0, 7, 31]
-ref = quants.dequantize(np.ascontiguousarray(table[ids]), T.Q2_K).astype(np.float32).reshape(len(ids), D)
-table.tofile(os.path.join(out, "emb_table.bin"))
-ref.tofile(os.path.join(out, "emb_ref.bin"))
-meta.append({"case": "emb_q2_k", "K": D, "N": V, "row_bytes": int(table.shape[1]), "ids": ids})
+for case, (qtype, bb, offs) in LAYOUT.items():
+    table = random_rows(bb, offs, V, D // 256)
+    ref = quants.dequantize(np.ascontiguousarray(table[ids]), qtype).astype(np.float32).reshape(len(ids), D)
+    table.tofile(os.path.join(out, "emb_" + case + "_table.bin"))
+    ref.tofile(os.path.join(out, "emb_" + case + "_ref.bin"))
+    meta.append({"case": "emb_" + case, "dtype": case.upper(), "K": D, "N": V,
+                 "row_bytes": int(table.shape[1]), "ids": ids})
 
 with open(os.path.join(out, "meta.json"), "w") as f:
     json.dump(meta, f, indent=1)

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 
 #define QK_K 256
 #define WARP_SIZE 32
@@ -387,13 +388,206 @@ void hpc_q6_K_gemv_kernel(const hpc_block_q6_K* __restrict__ W,
 }
 
 // ----------------------------------------------------------------------------
+// 4c. INT8-ACTIVATION (Q8) GEMV KERNELS: dp4a integer dot products
+// x is quantized once per call to int8 in blocks of 32 (xq) with one fp32
+// scale per block (xd = amax / 127), the same activation format llama.cpp
+// uses for its mmvq path. Weights are unpacked 4 at a time into int8 lanes
+// and multiplied with __dp4a; per-group scales/mins are applied in fp32.
+// Mapping: 16 lanes per superblock, so a warp works on 2 superblocks of one
+// row at a time; each lane handles 16 weights per superblock.
+// ----------------------------------------------------------------------------
+__device__ __forceinline__ float warp_reduce_max(float v) {
+    #pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
+    return v;
+}
+
+// One warp per 32-element block.
+__global__ void quantize_x_q8_kernel(const half* __restrict__ x, int8_t* __restrict__ xq,
+                                     float* __restrict__ xd, int K) {
+    const int lane = threadIdx.x & 31;
+    const int blk = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (blk * 32 >= K) return;
+    const float v = __half2float(x[blk * 32 + lane]);
+    const float amax = warp_reduce_max(fabsf(v));
+    const float d = amax / 127.0f;
+    const float inv = (d > 0.0f) ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * inv);
+    q = max(-127, min(127, q));
+    xq[blk * 32 + lane] = (int8_t)q;
+    if (lane == 0) xd[blk] = d;
+}
+
+// 4-byte load from a 2-byte aligned address (Q3_K blocks are 110 bytes).
+__device__ __forceinline__ uint32_t load_u32_a2(const uint8_t* p) {
+    const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+    return (uint32_t)q[0] | ((uint32_t)q[1] << 16);
+}
+
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void q2_K_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                         const float* __restrict__ xd, half* __restrict__ y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nb = K / QK_K;
+    const uint8_t* __restrict__ wr = W + (size_t)row * nb * 84;
+    const int hl = lane & 15, h = hl >> 3, m = hl & 7, c = m >> 2;
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nb; sb += 2) {
+        const uint8_t* b = wr + sb * 84;
+        const uint32_t q = *reinterpret_cast<const uint32_t*>(b + 16 + h * 32 + 4 * m);
+        const uint32_t sc0 = *reinterpret_cast<const uint32_t*>(b + h * 8);
+        const uint32_t sc1 = *reinterpret_cast<const uint32_t*>(b + h * 8 + 4);
+        const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b + 80));
+        const int8_t* xb = xq + sb * QK_K + h * 128 + 4 * m;
+        const float4 d8 = *reinterpret_cast<const float4*>(xd + sb * 8 + h * 4);
+        const float d8s[4] = {d8.x, d8.y, d8.z, d8.w};
+        float sd = 0.0f, sm = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const uint32_t scb = ((s < 2 ? sc0 : sc1) >> (8 * ((s & 1) * 2 + c))) & 0xFF;
+            const int v = (int)((q >> (2 * s)) & 0x03030303u);
+            const int xv = *reinterpret_cast<const int*>(xb + s * 32);
+            const int dot = __dp4a(v, xv, 0);
+            const int xs = __dp4a(0x01010101, xv, 0);
+            sd += d8s[s] * (float)(dot * (int)(scb & 0xF));
+            sm += d8s[s] * (float)(xs * (int)(scb >> 4));
+        }
+        acc += dm.x * sd - dm.y * sm;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void q3_K_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                         const float* __restrict__ xd, half* __restrict__ y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nb = K / QK_K;
+    const uint8_t* __restrict__ wr = W + (size_t)row * nb * 110;
+    const int hl = lane & 15, h = hl >> 3, m = hl & 7, c = m >> 2;
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nb; sb += 2) {
+        const uint8_t* b = wr + sb * 110;
+        const uint32_t hm = load_u32_a2(b + 4 * m);
+        const uint32_t q = load_u32_a2(b + 32 + h * 32 + 4 * m);
+        const uint32_t a0 = load_u32_a2(b + 96), a1 = load_u32_a2(b + 100), a2 = load_u32_a2(b + 104);
+        const float d = __half2float(*reinterpret_cast<const half*>(b + 108));
+        const int8_t* xb = xq + sb * QK_K + h * 128 + 4 * m;
+        const float* d8 = xd + sb * 8 + h * 4;
+        float sd = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int li = 2 * s + c;   // scale j = 8h + li; low nibble in byte li (shift 4h), high bits in byte 8 + (li & 3)
+            const uint32_t lb = ((li < 4 ? a0 : a1) >> (8 * (li & 3))) & 0xFF;
+            const uint32_t hb = (a2 >> (8 * (li & 3))) & 0xFF;
+            const int sc = (int)(((lb >> (4 * h)) & 0xF) | (((hb >> (2 * (2 * h + (s >> 1)))) & 3) << 4)) - 32;
+            const uint32_t lo = (q >> (2 * s)) & 0x03030303u;
+            const uint32_t hi = (hm >> (h * 4 + s)) & 0x01010101u;
+            const int v = (int)(lo | (hi << 2));   // 0..7, weight value = v - 4
+            const int xv = *reinterpret_cast<const int*>(xb + s * 32);
+            const int dot = __dp4a(v, xv, 0) - 4 * __dp4a(0x01010101, xv, 0);
+            sd += d8[s] * (float)(dot * sc);
+        }
+        acc += d * sd;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void q4_K_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                         const float* __restrict__ xd, half* __restrict__ y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nb = K / QK_K;
+    const uint8_t* __restrict__ wr = W + (size_t)row * nb * 144;
+    const int hl = lane & 15, j = hl >> 2, m = hl & 3;
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nb; sb += 2) {
+        const uint8_t* b = wr + sb * 144;
+        const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
+        const uint8_t* sc = b + 4;
+        const uint2 qq = *reinterpret_cast<const uint2*>(b + 16 + 32 * j + 8 * m);
+        // get_scale_min_k4 for is = 2j (low nibbles) and 2j + 1 (high nibbles)
+        int s_lo, m_lo, s_hi, m_hi;
+        {
+            const int is = 2 * j;
+            if (is < 4) { s_lo = sc[is] & 63; m_lo = sc[is + 4] & 63; }
+            else { s_lo = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); m_lo = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+            const int is1 = is + 1;
+            if (is1 < 4) { s_hi = sc[is1] & 63; m_hi = sc[is1 + 4] & 63; }
+            else { s_hi = (sc[is1 + 4] & 0xF) | ((sc[is1 - 4] >> 6) << 4); m_hi = (sc[is1 + 4] >> 4) | ((sc[is1] >> 6) << 4); }
+        }
+        const int8_t* xb = xq + sb * QK_K + 64 * j + 8 * m;
+        const int2 xl = *reinterpret_cast<const int2*>(xb);
+        const int2 xh = *reinterpret_cast<const int2*>(xb + 32);
+        const float2 d8 = *reinterpret_cast<const float2*>(xd + sb * 8 + 2 * j);
+        const int l0 = (int)(qq.x & 0x0F0F0F0Fu), l1 = (int)(qq.y & 0x0F0F0F0Fu);
+        const int h0 = (int)((qq.x >> 4) & 0x0F0F0F0Fu), h1 = (int)((qq.y >> 4) & 0x0F0F0F0Fu);
+        const int dot_lo = __dp4a(l1, xl.y, __dp4a(l0, xl.x, 0));
+        const int dot_hi = __dp4a(h1, xh.y, __dp4a(h0, xh.x, 0));
+        const int xs_lo = __dp4a(0x01010101, xl.y, __dp4a(0x01010101, xl.x, 0));
+        const int xs_hi = __dp4a(0x01010101, xh.y, __dp4a(0x01010101, xh.x, 0));
+        const float sd = d8.x * (float)(dot_lo * s_lo) + d8.y * (float)(dot_hi * s_hi);
+        const float sm = d8.x * (float)(xs_lo * m_lo) + d8.y * (float)(xs_hi * m_hi);
+        acc += dm.x * sd - dm.y * sm;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+// ----------------------------------------------------------------------------
 // 5. HOST LAUNCHERS & TELEMETRY INFRASTRUCTURE
 // ----------------------------------------------------------------------------
 namespace friday_hpc {
 
 constexpr int kWarpsPerBlock = 8;
+constexpr int kQ8WarpsPerBlock = 4;
+
+// FRIDAY_GEMV_FP32=1 selects the previous fp32-activation kernels (A/B testing).
+static bool useFp32Gemv() {
+    static const bool v = [] { const char* e = std::getenv("FRIDAY_GEMV_FP32"); return e && e[0] == '1'; }();
+    return v;
+}
+
+// Scratch for the int8 activation. Grows on demand (first calls only); all GEMVs
+// run on the same compute stream, so reuse between consecutive calls is ordered.
+static int8_t* g_xq = nullptr;
+static float* g_xd = nullptr;
+static int g_xq_cap = 0;
+
+static void quantizeX(const half* x, int K, cudaStream_t s) {
+    if (K % QK_K != 0) { std::fprintf(stderr, "GEMV: K=%d is not a multiple of 256\n", K); std::abort(); }
+    if (K > g_xq_cap) {
+        cudaStreamSynchronize(s);
+        if (g_xq) { cudaFree(g_xq); cudaFree(g_xd); }
+        if (cudaMalloc(&g_xq, K) != cudaSuccess || cudaMalloc(&g_xd, (K / 32) * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "GEMV: cannot allocate activation scratch\n"); std::abort();
+        }
+        g_xq_cap = K;
+    }
+    const int blocks32 = K / 32, warps = 8;
+    quantize_x_q8_kernel<<<(blocks32 + warps - 1) / warps, warps * WARP_SIZE, 0, s>>>(x, g_xq, g_xd, K);
+}
+
+template <void (*KERNEL)(const uint8_t*, const int8_t*, const float*, half*, int, int)>
+static void launchQ8(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    quantizeX(x, K, s);
+    const dim3 grid((N + kQ8WarpsPerBlock - 1) / kQ8WarpsPerBlock);
+    KERNEL<<<grid, kQ8WarpsPerBlock * WARP_SIZE, 0, s>>>(static_cast<const uint8_t*>(W), g_xq, g_xd, y, N, K);
+}
 
 void launch_q2_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    if (!useFp32Gemv()) { launchQ8<q2_K_q8_gemv_kernel<kQ8WarpsPerBlock>>(x, W, y, K, N, s); return; }
     const dim3 grid((N + kWarpsPerBlock - 1) / kWarpsPerBlock);
     const dim3 block(kWarpsPerBlock * WARP_SIZE);
     switch (g_reduction_variant) {
@@ -406,6 +600,7 @@ void launch_q2_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaSt
 }
 
 void launch_q3_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    if (!useFp32Gemv()) { launchQ8<q3_K_q8_gemv_kernel<kQ8WarpsPerBlock>>(x, W, y, K, N, s); return; }
     const dim3 grid((N + kWarpsPerBlock - 1) / kWarpsPerBlock);
     const dim3 block(kWarpsPerBlock * WARP_SIZE);
     switch (g_reduction_variant) {
@@ -418,6 +613,7 @@ void launch_q3_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaSt
 }
 
 void launch_q4_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    if (!useFp32Gemv()) { launchQ8<q4_K_q8_gemv_kernel<kQ8WarpsPerBlock>>(x, W, y, K, N, s); return; }
     const dim3 grid((N + kWarpsPerBlock - 1) / kWarpsPerBlock);
     const dim3 block(kWarpsPerBlock * WARP_SIZE);
     switch (g_reduction_variant) {

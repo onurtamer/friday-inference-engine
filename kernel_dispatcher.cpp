@@ -31,8 +31,9 @@ void FridayKernelDispatcher::dispatchGemvKernel(
 {
     switch (quant_type) {
         case FP16: {
-            // launchGemvFP16Wrapper(static_cast<const half*>(d_weights), d_activations, d_output, K, N, stream);
-            break;
+            // Not implemented: previously this returned without writing d_output.
+            fprintf(stderr, "Error: FP16 GEMV is not implemented\n");
+            exit(EXIT_FAILURE);
         }
         case INT8: {
             launchQ8_0GemvKernel(
@@ -57,8 +58,9 @@ void FridayKernelDispatcher::dispatchGemvKernel(
             break;
         }
         case TERNARY: {
-            // launchTernaryGemvKernel(d_activations, static_cast<const unsigned char*>(d_weights), d_output, K, N, stream);
-            break;
+            // Not implemented: previously this returned without writing d_output.
+            fprintf(stderr, "Error: TERNARY GEMV is not implemented\n");
+            exit(EXIT_FAILURE);
         }
         case Q4_1: {
             launchQ4_1GemvKernel(
@@ -73,7 +75,7 @@ void FridayKernelDispatcher::dispatchGemvKernel(
         }
         case Q6_K: {
             // Warp-per-row coalesced kernel (hpc_k_quants.cu). The previous
-            // thread-per-row launchQ6_KGemvKernel read memory uncoalesced.
+            // thread-per-row Q6_K kernel (removed) read memory uncoalesced.
             friday_hpc::launch_q6_K_hpc(d_activations, d_weights, d_output, K, N, stream);
             break;
         }
@@ -96,5 +98,13 @@ void FridayKernelDispatcher::dispatchGemvKernel(
             fprintf(stderr, "Error: Bilinmeyen veya desteklenmeyen nicelendirme tipi: %d\n", quant_type);
             exit(EXIT_FAILURE);
         }
+    }
+    // Launch errors (bad configuration, missing kernel image, ...) are reported here
+    // instead of surfacing at the next synchronizing call.
+    const cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "Error: GEMV launch failed (quant type %d, K=%d, N=%d): %s\n", quant_type, K, N,
+                cudaGetErrorString(launch_err));
+        exit(EXIT_FAILURE);
     }
 }

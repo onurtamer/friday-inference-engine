@@ -6,6 +6,7 @@
 #include <cstdint>
 
 // Macro to check for CUDA errors
+#ifndef CUDA_CHECK
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -14,6 +15,7 @@
             exit(EXIT_FAILURE); \
         } \
     } while (0)
+#endif
 
 #define QK_K 256
 
@@ -77,17 +79,6 @@ void launchQ4_1GemvKernel(
 void launchQ8_0GemvKernel(
     const half* d_activations,
     const block_q8_0* d_quantized_weights,
-    half* d_output,
-    int K,
-    int N,
-    cudaStream_t stream);
-
-/**
- * @brief Host-side wrapper function to launch the GGUF Q6_K GEMV kernel.
- */
-void launchQ6_KGemvKernel(
-    const half* d_activations,
-    const block_q6_K* d_quantized_weights,
     half* d_output,
     int K,
     int N,

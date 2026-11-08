@@ -23,13 +23,18 @@ recorded, docs updated, commit reviewed.
 ## Progress
 
 - **R0 — done (2026-11-07).** Clean clone builds; CTest suite (unit/gpu/model).
-- **R1 — in progress.**
+- **R1 — done (2026-11-08).**
   - [x] BPE tokenizer matches the reference Qwen2 tokenizer (20/20 ids).
   - [x] Kernel tests vs. gguf reference dequantization (Q2_K/Q3_K/Q4_K/Q6_K, Q2_K embedding).
   - [x] Logits vs. a reference runtime: llama.cpp b12189, Qwen2.5-32B Q2_K, 32/32
         greedy tokens identical, top-1 log-prob diff median 0.002 / max 0.28.
-  - [ ] Embeddings for the remaining K-quant types; kernel launch error checks.
-  - [ ] ASAN + compute-sanitizer clean; build warnings (C4297, LNK4098).
+  - [x] Embeddings for every K-quant type (Q2_K/Q3_K/Q4_K/Q6_K, plus Q4_0/F16),
+        tested against gguf dequantization; GEMV and attention launches checked;
+        unimplemented FP16/TERNARY GEMV now fail loudly instead of returning garbage.
+  - [x] compute-sanitizer (memcheck, racecheck, initcheck, synccheck) clean on the
+        GPU tests and on a 2-token model run (memcheck, racecheck; initcheck needs more host RAM than this 16 GB machine has with the 32B model); ASAN (MSVC) clean on unit/GPU tests and the full model golden test.
+  - [x] Build warnings fixed (C4297, LNK4098, C4005); CMake sm_86 default was dead
+        code (set after `project()`, everything built for sm_52) — fixed.
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).
@@ -41,6 +46,22 @@ recorded, docs updated, commit reviewed.
   - Step 2 (2026-11-08): GPU decode attention + fp16 KV cache on the GPU
     (`--ctx`, default 2048 = 512 MiB) → 3.44 tok/s decode, 3.52 tok/s prefill
     (median of 3; 52/64 layers on GPU). Golden v2 unchanged (32/32, max 0.28).
+  - Step 3a: Q2_K/Q3_K/Q4_K GEMV with int8 activations + `__dp4a` (80–90% of VRAM
+    bandwidth, was 14–28%) → 5.36 tok/s. Numerics: activation quantized per 32
+    values, as in llama.cpp's mmvq; golden unchanged.
+  - Step 3b: measured PCIe 3.0 x16 at 13 GB/s vs host RAM ~38 GB/s, so streaming
+    weights every token loses to computing on the CPU. Non-resident layers now run
+    on the CPU (AVX2 K-quant GEMV, same int8 activations and fp16 rounding points);
+    no DMA slots, KV cache per GPU layer only → 9.71 tok/s (56 GPU / 8 CPU).
+  - Step 3c: embedding table in host RAM (one row uploaded per token, numerics
+    identical), 8 CPU threads → **10.55 tok/s decode, 10.2 tok/s prefill** (median
+    of 3, 57 GPU / 7 CPU). Golden 32/32, max top-1 diff 0.27. llama.cpp: 8.3 / 73.5.
+  - Evaluated next (2026-11-08, measured with microbenchmarks):
+    CUDA Graph of the GPU phase −4.5 ms/token (45.3 → 40.8 ms; GEMV-only floor
+    39 ms); split-K decode attention: +7 ms at 1024 context today, mostly
+    recoverable; naive batched dp4a prefill only 1.4× at B=16 (compute-bound) —
+    prefill needs tensor-core int8 GEMM; 8-bit KV would free ~220 MiB (+1 GPU
+    layer, ~−5.5 ms/token).
 
 ## v1.0 — public local inference engine
 

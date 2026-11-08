@@ -28,7 +28,7 @@
 
 Modern cloud and edge LLM deployments are heavily constrained by high memory demands and runtime overhead. Running a **14-Billion parameter** model (like `Qwen2.5-14B-Instruct`) typically requires 10 GB – 16 GB of dedicated GPU VRAM. 
 
-FRIDAY Engine breaks this barrier using **Elastic Tiered Memory (ETM)** combined with **native custom CUDA GEMV kernels** and **asynchronous PCIe ping-pong streaming**. It automatically partitions transformer layers between GPU VRAM and Host RAM, completely eliminates disk reading bottlenecks during autoregressive generation, and streams responses token-by-token in real time.
+FRIDAY Engine splits a model between the GPU and the CPU (**Elastic Tiered Memory**): as many transformer layers as fit are kept in VRAM and computed with custom CUDA kernels; the remaining layers stay in host RAM and are computed on the CPU with SIMD kernels, so no weights cross PCIe during generation. On an RTX 3060 12 GB + Ryzen 5 5600X, Qwen2.5-32B-Instruct Q2_K decodes at ~10.4 tok/s (llama.cpp b12189 on the same machine: 8.3 tok/s); see [Benchmarks](#-benchmarks).
 
 ---
 
@@ -43,45 +43,39 @@ flowchart TD
 
     subgraph Initialization["2. Elastic Tiered Memory Initialization"]
         BIN --> ETM["Elastic Tiered Memory Manager"]
-        ETM -->|Static Tensors| EMB["token_embd.weight & output.weight (GPU)"]
-        ETM -->|VRAM Limit Filter| GPU_LAYERS["GPU-Resident Layers (0 .. N)"]
-        ETM -->|Zero Disk I/O| HOST_CACHE["Host RAM Pinned Cache (N+1 .. 47)"]
+        ETM -->|Static Tensors| EMB["output.weight + output_norm (GPU), token_embd (host RAM)"]
+        ETM -->|VRAM budget incl. KV cache| GPU_LAYERS["GPU layers 0 .. N-1 + their KV cache"]
+        ETM -->|Rest| HOST_LAYERS["CPU layers N .. L-1 in host RAM + their KV cache"]
     end
 
-    subgraph Inference["3. Asynchronous Ping-Pong Inference Loop"]
+    subgraph Inference["3. Per-token decode"]
         direction TB
-        GPU_LAYERS -->|Zero-Copy VRAM Execution| COMPUTE["CUDA Stream 1: GEMV Compute"]
-        HOST_CACHE -->|Overlapped PCIe DMA Transfer| DMA["CUDA Stream 2: Asynchronous Prefetch"]
-        DMA -.->|Ping-Pong Ping/Pong Buffers| COMPUTE
-    end
-
-    subgraph Kernels["4. Native CUDA Kernels & Output"]
-        COMPUTE --> RMS["RMSNorm Kernel (Warp Shuffle)"]
-        RMS --> ATTN["Custom RoPE (Base 1M) on GPU; GQA attention on CPU"]
-        ATTN --> SOFTMAX["FP32-Safe Softmax (Overflow-Proof)"]
-        SOFTMAX --> MLP["SwiGLU Activation + Down Projection"]
-        MLP --> STREAM["BPE UTF-8 Tokenizer -> Console Stream"]
+        GPU_LAYERS --> GPU_PHASE["GPU: RMSNorm, dp4a K-quant GEMV, RoPE, GQA attention, SwiGLU"]
+        GPU_PHASE -->|hidden state, 10 KB| CPU_PHASE["CPU: AVX2 K-quant GEMV + the same ops, thread pool"]
+        HOST_LAYERS --> CPU_PHASE
+        CPU_PHASE -->|hidden state, 10 KB| HEAD["GPU: final norm + LM head"]
+        HEAD --> STREAM["BPE UTF-8 Tokenizer -> Console Stream"]
     end
 ```
 
 ### 1. 🧠 Elastic Tiered Memory (ETM) Architecture
 - **Dynamic VRAM Sizing (`--vram <gb>`):** The engine probes total and available physical VRAM dynamically (or obeys a user-specified limit such as `--vram 6.0`).
-- **GPU-Resident Layer Priority:** Static critical structures (embedding table, RMSNorm weights, output LM head, and activation ping-pong buffers) are locked into VRAM. As many transformer layers as possible are placed permanently in high-speed GPU memory.
-- **Pinned Host RAM Pre-Caching:** Non-resident layers are pre-loaded into Host RAM during startup. **No disk I/O occurs during token generation**, completely bypassing the storage latency wall.
-- **Asynchronous Ping-Pong Double Buffering:** Layers streamed from Host RAM utilize two scratch device buffers (`Buffer A` and `Buffer B`) and two independent CUDA streams (`stream_compute` and `stream_io`). While the GPU computes Layer $L$ on Buffer A, CUDA asynchronous DMA (`cudaMemcpyAsync`) transfers Layer $L+1$ into Buffer B simultaneously.
+- **GPU layers first:** the LM head and output norm stay in VRAM; then as many transformer layers as fit, each charged with its share of the GPU KV cache (`--ctx`). The embedding table lives in host RAM (one row is uploaded per token).
+- **CPU layers:** the remaining layers are loaded into host RAM at startup and computed on the CPU (`--threads`, default 2/3 of the logical CPUs). Only the 10 KB hidden state crosses PCIe, twice per token. No disk I/O occurs during generation.
+- **Why not stream weights over PCIe?** Measured on the dev box: PCIe 3.0 x16 moves ~13 GB/s, the CPU reads host RAM at ~38 GB/s, so computing a non-resident layer on the CPU (~6 ms) beats copying it to the GPU every token (~13 ms). The previous streaming mode (DMA slots, two CUDA streams) is still available with `FRIDAY_OFFLOAD=stream`.
 
 ### 2. ⚡ Native Custom CUDA GEMV Kernels
-FRIDAY does not link against external BLAS or inference libraries. Every operation is hand-crafted in CUDA:
-- **`Q4_0` GEMV Kernel:** Unpacks 4-bit nibbles on-the-fly from 32-element blocks with FP16 scales using warp-level reduction primitives (`__shfl_down_sync`).
-- **`Q4_1` GEMV Kernel:** Handles 4-bit quantization with dual parameters (scale + min/bias FP16).
-- **`Q6_K` GEMV Kernel:** Decodes 256-element super-blocks composed of 16 sub-scales, lower 4-bit nibbles, and upper 2-bit bitfields in register space.
-- **`Q8_0` GEMV Kernel:** High-precision 8-bit quantized matrix-vector multiplication.
+FRIDAY does not link against external BLAS or inference libraries. Every operation is hand-written:
+- **K-quant GEMV with int8 activations (`Q2_K`, `Q3_K`, `Q4_K`):** the activation is quantized to int8 in blocks of 32 (as in llama.cpp's mmvq path) and weights are multiplied with `__dp4a`; 80–90% of the RTX 3060's memory bandwidth on the large matrices. `FRIDAY_GEMV_FP32=1` selects the older fp32-activation kernels.
+- **CPU K-quant GEMV (AVX2/FMA/F16C):** same int8 activation format, `maddubs`-based dot products, runtime CPU check with a scalar fallback; ~34 GB/s on a Ryzen 5 5600X.
+- **`Q6_K` GEMV Kernel:** warp-per-row, coalesced (LM head).
+- **`Q4_0` / `Q4_1` / `Q8_0` GEMV Kernels:** legacy formats.
 - **Fast RMSNorm:** Vectorized FP32/FP16 normalization with warp-shuffle reduction.
 - **Custom RoPE (Rotary Position Embeddings):** Direct device rotation supporting rotary base frequencies up to $1,000,000$ (as required by modern Qwen2.5 models).
 - **SwiGLU Non-Linearity:** Parallel fused kernel computing `silu(gate) * up` in place.
 
 ### 3. 🛡️ Numerically Stable FP32-Safe Softmax
-> In the current version, self-attention and its softmax run on the **CPU** (Q/K/V are copied to host memory and the KV cache lives in host RAM). Moving attention and the KV cache to the GPU is planned (roadmap R4).
+> Decode attention runs where its layer runs: a CUDA kernel over the fp16 GPU KV cache for GPU layers, and a multithreaded CPU implementation (same math and fp16 rounding points) for CPU layers.
 
 Under Grouped-Query Attention (GQA) with scaling factors ($1 / \sqrt{d_k}$), standard FP16 softmax accumulators often experience exponent overflow or catastrophic cancellation, producing `NaN` or infinite values.
 FRIDAY Engine implements a **two-pass online Safe Softmax**:
@@ -192,18 +186,23 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | Option | Argument | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `--vram` | `<float>` | Maximum GPU VRAM to allocate for weights and buffers (in GB). | `0.0` (Auto-detect free VRAM) |
-| `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). Allocated on the GPU in fp16 (~256 KiB per token for Qwen2.5-32B). | `2048` |
+| `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). GPU layers keep it in VRAM (fp16, 4 KiB per token per layer for Qwen2.5-32B), CPU layers in host RAM. | `2048` |
+| `--threads` | `<int>` | CPU threads for the CPU-computed layers. | `0` (2/3 of the logical CPUs) |
 | `<model_path>`| `<string>` | Path to the 4KB sector-aligned binary model file. | `friday_aligned_int4.bin` |
 
 ---
 
-## 📊 Technical Verification & Results
+## 📊 Benchmarks
 
-Measured by the author on **NVIDIA GeForce RTX 3060 12 GB (desktop) / 16 GB DDR4 RAM**, with the engine's VRAM budget capped at **6.0 GB** (`--vram 6.0`). This emulates a 6 GB budget; it is not a run on a physical 6 GB card (driver reservations and display usage differ). A reproducible benchmark script is planned (roadmap R5); throughput figures will be published with it.
-- **Model:** `Qwen2.5-14B-Instruct` (48 Layers, Hidden Dim: 5120, Intermediate: 13824, Heads: 40, KV Heads: 8, Vocab: 152064).
-- **VRAM Footprint:** Runs within the **6.0 GB VRAM budget**.
-- **Execution:** Layers 0–20 reside permanently in GPU VRAM; Layers 21–47 are streamed from Host Pinned RAM via dual-stream ping-pong buffers.
-- **Latency:** Zero disk I/O during generation; smooth real-time token streaming to console with coherent, logically sound outputs.
+Measured by the author on one machine: **RTX 3060 12 GB (PCIe 3.0 x16), Ryzen 5 5600X, 16 GB DDR4, Windows 11**, model **Qwen2.5-32B-Instruct Q2_K** (64 layers), the golden-test prompt (~50 tokens prompt, 32 generated, greedy), full VRAM, `--ctx 2048`. Median of 3 runs; desktop applications were open. A controlled benchmark tool (N repeats, median/p95, GPU clocks, free RAM) is planned (roadmap R5).
+
+| Engine | Layers GPU / CPU | Decode tok/s | Prefill tok/s |
+| :--- | :--- | ---: | ---: |
+| **FRIDAY** (this repo) | 57 / 7 | **~10.4** | ~10.2 |
+| llama.cpp b12189 (CUDA 12.4 build) | 50 / 14 | 8.3 | 73.5 |
+
+- Prefill in FRIDAY is still token by token (batched prefill with tensor-core GEMM is on the roadmap), so llama.cpp is far ahead there.
+- Outputs are checked against llama.cpp on every change: 32/32 identical greedy tokens, max top-1 log-prob difference 0.27 (`ctest -L model`).
 
 ---
 

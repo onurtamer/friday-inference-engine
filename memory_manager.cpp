@@ -46,7 +46,12 @@ ZeroCopyMemoryManager::~ZeroCopyMemoryManager() {
     std::lock_guard<std::mutex> lock(this->_mutex);
     for (auto const& [ptr, size] : this->_allocated_blocks) {
         if (ptr != nullptr) {
-            CUDA_CHECK(cudaFreeHost(ptr));
+            // Destructors must not throw (C4297): report and continue.
+            const cudaError_t err = cudaFreeHost(ptr);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "~ZeroCopyMemoryManager: cudaFreeHost(%p) failed: %s\n", ptr, cudaGetErrorString(err));
+                continue;
+            }
             fprintf(stdout, "Deallocated pinned memory block at %p, size %zu bytes.\n", ptr, size);
         }
     }

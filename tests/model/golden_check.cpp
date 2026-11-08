@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -81,6 +82,12 @@ int main(int argc, char** argv) {
     }
     const std::string model_path = argv[1], tensor_map = argv[2], golden_dir = argv[3], tok_cfg = argv[4];
     const double vram_gb = std::stod(argv[5]);
+    // Unbuffered output: progress stays visible when stdout is redirected to a file.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    // FRIDAY_GOLDEN_MAX_STEPS=N: smoke run (e.g. under compute-sanitizer) that only
+    // processes the first N prompt tokens, prints progress, and exits without comparing.
+    const char* max_steps_env = std::getenv("FRIDAY_GOLDEN_MAX_STEPS");
+    const int max_steps = max_steps_env ? std::atoi(max_steps_env) : 0;
     try {
         const auto golden = loadJson(golden_dir + "/output_tokens.json");
         const auto cfg = loadJson(golden_dir + "/model_config.json");
@@ -144,6 +151,17 @@ int main(int argc, char** argv) {
         };
 
         auto t0 = std::chrono::steady_clock::now();
+        if (max_steps > 0) {
+            for (int i = 0; i < max_steps && i < (int)prompt_len; ++i) {
+                auto ts = std::chrono::steady_clock::now();
+                step(tokens[i], i);
+                printf("[GOLDEN] smoke step %d done (%.1f s)\n", i,
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
+            }
+            printf("[GOLDEN] smoke run finished after %d steps (no comparison)\n", max_steps);
+            CUDA_CHECK(cudaFree(d_logits)); CUDA_CHECK(cudaFree(d_act)); CUDA_CHECK(cudaStreamDestroy(s));
+            return 0;
+        }
         for (size_t i = 0; i < prompt_len; ++i) step(tokens[i], (int)i);
         auto t1 = std::chrono::steady_clock::now();
 

@@ -1,5 +1,10 @@
 #include "transformer.h"
 #include "attention_kernels.h"
+#include "cpu_kquants.h"
+#include "cpu_ops.h"
+#include "cpu_threadpool.h"
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include "io_manager.h"
 #include "kernel_dispatcher.h"
@@ -79,6 +84,76 @@ __global__ void dequantize_q2_K_row_kernel(const uint8_t* row, half* out, int di
     out[idx] = __float2half(v);
 }
 
+// GGML Q3_K / Q4_K / Q6_K row dequant (one thread per element), same formulas
+// as the GEMV kernels in hpc_k_quants.cu and gguf-py's reference dequantizer.
+__global__ void dequantize_q3_K_row_kernel(const uint8_t* row, half* out, int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    const uint8_t* b = row + (idx / 256) * 110;   // hmask[32] qs[64] scales[12] d
+    const int r = idx % 256, h = r / 128, s = (r % 128) / 32, l = r % 32;
+    const int j = h * 8 + 2 * s + (l >= 16 ? 1 : 0);
+    const uint8_t* sc = b + 96;
+    const int low = j < 8 ? (sc[j] & 0xF) : (sc[j - 8] >> 4);
+    const int high = (sc[8 + (j % 4)] >> (2 * (j / 4))) & 3;
+    const int scale = (low | (high << 4)) - 32;
+    const int q = ((b[32 + h * 32 + l] >> (2 * s)) & 3) - ((b[l] & (1 << (h * 4 + s))) ? 0 : 4);
+    const half d = *reinterpret_cast<const half*>(b + 108);
+    out[idx] = __float2half(__half2float(d) * (float)scale * (float)q);
+}
+
+__global__ void dequantize_q4_K_row_kernel(const uint8_t* row, half* out, int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    const uint8_t* b = row + (idx / 256) * 144;   // d dmin scales[12] qs[128]
+    const int r = idx % 256, j = r / 64, hi = (r % 64) / 32, l = r % 32;
+    const int is = 2 * j + hi;
+    const uint8_t* q = b + 4;
+    int sc, m;
+    if (is < 4) { sc = q[is] & 63; m = q[is + 4] & 63; }
+    else { sc = (q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4); m = (q[is + 4] >> 4) | ((q[is] >> 6) << 4); }
+    const uint8_t qb = b[16 + 32 * j + l];
+    const int v = hi ? (qb >> 4) : (qb & 0xF);
+    const float d = __half2float(*reinterpret_cast<const half*>(b));
+    const float dmin = __half2float(*reinterpret_cast<const half*>(b + 2));
+    out[idx] = __float2half(d * (float)sc * (float)v - dmin * (float)m);
+}
+
+__global__ void dequantize_q6_K_row_kernel(const uint8_t* row, half* out, int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    const uint8_t* b = row + (idx / 256) * 210;   // ql[128] qh[64] scales[16] d
+    const int r = idx % 256, h = r / 128, part = (r % 128) / 32, l = r % 32;
+    const uint8_t ql = b[h * 64 + l + (part & 1) * 32];
+    const uint8_t qh = b[128 + h * 32 + l];
+    const int lo = (part < 2) ? (ql & 0xF) : (ql >> 4);
+    const int q = (lo | (((qh >> (2 * part)) & 3) << 4)) - 32;
+    const int8_t sc = reinterpret_cast<const int8_t*>(b + 192)[h * 8 + (l / 16) + 2 * part];
+    const float d = __half2float(*reinterpret_cast<const half*>(b + 208));
+    out[idx] = __float2half(d * (float)sc * (float)q);
+}
+
+bool launchDequantizeRow(const std::string& dtype, const uint8_t* d_row, half* d_out, int dim, cudaStream_t s) {
+    const int threads = 256, blocks = (dim + threads - 1) / threads;
+    if (dtype == "Q4_0") dequantize_q4_0_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "Q2_K") dequantize_q2_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "Q3_K") dequantize_q3_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "Q4_K") dequantize_q4_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "Q6_K") dequantize_q6_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "F16") return cudaMemcpyAsync(d_out, d_row, (size_t)dim * sizeof(half), cudaMemcpyDeviceToDevice, s) == cudaSuccess;
+    else return false;
+    return cudaGetLastError() == cudaSuccess;
+}
+
+size_t embeddingRowBytes(const std::string& dtype, int dim) {
+    if (dtype == "Q4_0") return (size_t)(dim / 32) * 18;
+    if (dtype == "Q2_K") return (size_t)(dim / 256) * 84;
+    if (dtype == "Q3_K") return (size_t)(dim / 256) * 110;
+    if (dtype == "Q4_K") return (size_t)(dim / 256) * 144;
+    if (dtype == "Q6_K") return (size_t)(dim / 256) * 210;
+    if (dtype == "F16") return (size_t)dim * sizeof(half);
+    return 0;
+}
+
 QuantType Transformer::getQuantTypeFromDtype(const std::string& dtype_str) {
     if (dtype_str == "F16" || dtype_str == "F32") return FP16;
     if (dtype_str == "Q4_0") return INT4;
@@ -104,7 +179,8 @@ Transformer::Transformer(
     QuantType model_quant_type,
     AsyncIOManager* async_io_manager_ptr,
     double vram_limit_gb,
-    int max_context
+    int max_context,
+    int cpu_threads
 )
     : model_file_path_(model_file_path),
       hidden_dim_(model_hidden_dim),
@@ -157,15 +233,10 @@ Transformer::Transformer(
     CUDA_CHECK(cudaMemset(d_gate_out_, 0, max_intermediate_size_ * sizeof(half)));
     CUDA_CHECK(cudaMemset(d_up_out_, 0, max_intermediate_size_ * sizeof(half)));
 
-    // KV cache on the GPU. Allocated before the residency planner measures free
-    // VRAM, so it is part of the deterministic budget.
+    CUDA_CHECK(cudaMalloc((void**)&d_attn_ctx_, hidden_dim_ * sizeof(half)));
     {
-        const size_t kv_elems = (size_t)num_layers_ * max_ctx_ * num_kv_heads_ * head_dim_;
-        CUDA_CHECK(cudaMalloc((void**)&d_k_cache_, kv_elems * sizeof(half)));
-        CUDA_CHECK(cudaMalloc((void**)&d_v_cache_, kv_elems * sizeof(half)));
-        CUDA_CHECK(cudaMalloc((void**)&d_attn_ctx_, hidden_dim_ * sizeof(half)));
-        printf("[Transformer] GPU KV cache: max context %d, %.0f MiB (K + V)\n", max_ctx_,
-               (double)(2 * kv_elems * sizeof(half)) / (1024.0 * 1024.0));
+        const char* e = std::getenv("FRIDAY_OFFLOAD");
+        cpu_offload_ = !(e && std::strcmp(e, "stream") == 0);
     }
 
     // =========================================================================
@@ -175,11 +246,14 @@ Transformer::Transformer(
     if (!full_tensor_map_.count(emb_name)) emb_name = "model.embed_tokens.weight";
     if (full_tensor_map_.count(emb_name)) {
         const auto& info = full_tensor_map_.at(emb_name);
-        CUDA_CHECK(cudaMalloc((void**)&d_token_embd_, info.size_bytes));
-        std::vector<unsigned char> h_emb(info.size_bytes);
-        if (async_io_manager_ptr_->readLayerToHost(info.absolute_offset, info.size_bytes, h_emb.data())) {
-            CUDA_CHECK(cudaMemcpy(d_token_embd_, h_emb.data(), info.size_bytes, cudaMemcpyHostToDevice));
-            printf("[Transformer] Statik tensor '%s' GPU'ya yuklendi (%.2f MB)\n",
+        // The embedding table stays in host RAM (one row is needed per token), which
+        // frees its VRAM for transformer layers. getEmbedding() stages one row.
+        h_token_embd_.reset(new unsigned char[info.size_bytes]);
+        if (async_io_manager_ptr_->readLayerToHost(info.absolute_offset, info.size_bytes, h_token_embd_.get())) {
+            const size_t max_row = (size_t)hidden_dim_ * sizeof(half);  // largest supported row (F16)
+            CUDA_CHECK(cudaMalloc((void**)&d_token_embd_, max_row));
+            CUDA_CHECK(cudaMallocHost((void**)&h_emb_row_pinned_, max_row));
+            printf("[Transformer] Statik tensor '%s' host RAM'de (%.2f MB)\n",
                    emb_name.c_str(), (float)info.size_bytes / (1024.0f * 1024.0f));
         } else {
             fprintf(stderr, "Hata: '%s' tensörü okunamadi!\n", emb_name.c_str());
@@ -230,8 +304,13 @@ Transformer::Transformer(
     CUDA_CHECK(cudaMemGetInfo(&free_bytes_before_residency, &total_bytes));
 
     const size_t kMinGpuReserveBytes = 384ULL * 1024ULL * 1024ULL;
-    const size_t dma_reservation = (size_t)kDmaSlotCount * layer_buffer_size_;
-    const size_t required_overhead = kMinGpuReserveBytes + dma_reservation;
+    // GPU KV cache per layer (K + V, fp16). In CPU-offload mode only GPU layers
+    // need it, so it is charged per resident layer; in stream mode every layer
+    // is computed on the GPU and the whole cache is reserved up front.
+    const size_t kv_layer_bytes = 2ULL * max_ctx_ * num_kv_heads_ * head_dim_ * sizeof(half);
+    const size_t dma_reservation = cpu_offload_ ? 0 : (size_t)kDmaSlotCount * layer_buffer_size_;
+    const size_t kv_reservation = cpu_offload_ ? 0 : (size_t)num_layers_ * kv_layer_bytes;
+    const size_t required_overhead = kMinGpuReserveBytes + dma_reservation + kv_reservation;
 
     size_t budget = free_bytes_before_residency;
     if (vram_limit_gb_ > 0.1) {
@@ -252,10 +331,10 @@ Transformer::Transformer(
     num_gpu_resident_layers_ = 0;
     size_t resident_weight_bytes = 0;
     for (int i = 0; i < num_layers_; ++i) {
-        const size_t l_size = layers_info_[i].size_bytes;
+        const size_t l_size = layers_info_[i].size_bytes + (cpu_offload_ ? kv_layer_bytes : 0);
         if (available_for_resident < l_size) break;
         available_for_resident -= l_size;
-        resident_weight_bytes += l_size;
+        resident_weight_bytes += layers_info_[i].size_bytes;
         num_gpu_resident_layers_++;
     }
     const int num_streamed = num_layers_ - num_gpu_resident_layers_;
@@ -265,10 +344,20 @@ Transformer::Transformer(
            (double)total_bytes / (1u << 30), (double)free_bytes_before_residency / (1u << 30));
     if (vram_limit_gb_ > 0.1) printf(" | --vram cap: %.2f GB", vram_limit_gb_);
     printf("\n  Reserved: %zu MiB safety + %zu MiB DMA (%d slots)\n",
-           kMinGpuReserveBytes >> 20, dma_reservation >> 20, kDmaSlotCount);
-    printf("  GPU-resident layers: %d / %d (%.2f GB) | host-streamed: %d\n",
-           num_gpu_resident_layers_, num_layers_, (double)resident_weight_bytes / (1u << 30), num_streamed);
+           kMinGpuReserveBytes >> 20, dma_reservation >> 20, cpu_offload_ ? 0 : kDmaSlotCount);
+    printf("  GPU-resident layers: %d / %d (%.2f GB) | %s: %d\n",
+           num_gpu_resident_layers_, num_layers_, (double)resident_weight_bytes / (1u << 30),
+           cpu_offload_ ? "CPU-computed" : "host-streamed", num_streamed);
     printf("=======================================================\n\n");
+
+    {
+        const int kv_layers = cpu_offload_ ? num_gpu_resident_layers_ : num_layers_;
+        const size_t kv_elems = (size_t)(kv_layers > 0 ? kv_layers : 1) * max_ctx_ * num_kv_heads_ * head_dim_;
+        CUDA_CHECK(cudaMalloc((void**)&d_k_cache_, kv_elems * sizeof(half)));
+        CUDA_CHECK(cudaMalloc((void**)&d_v_cache_, kv_elems * sizeof(half)));
+        printf("[Transformer] GPU KV cache: %d layers, max context %d, %.0f MiB (K + V)\n", kv_layers, max_ctx_,
+               (double)(2 * kv_elems * sizeof(half)) / (1024.0 * 1024.0));
+    }
 
     // Streams are created before any event is recorded on them.
     CUDA_CHECK(cudaStreamCreate(&stream_compute_));
@@ -287,8 +376,39 @@ Transformer::Transformer(
         printf("[Transformer] %d adet katman GPU VRAM'e kalici yuklendi (Sifir transfer gecikmesi).\n", num_gpu_resident_layers_);
     }
 
-    // 2. Stream edilecek katmanlar varsa, DMA slotlarini ve Host Onbellegi hazirla
-    if (num_streamed > 0) {
+    // 2a. CPU-offload mode: keep the remaining layers in host RAM and compute them on the CPU.
+    if (cpu_offload_ && num_streamed > 0) {
+        h_cpu_layers_.resize(num_streamed);
+        for (int i = 0; i < num_streamed; ++i) {
+            const auto& l_info = layers_info_[num_gpu_resident_layers_ + i];
+            h_cpu_layers_[i].reset(new unsigned char[l_info.size_bytes]);
+            if (!async_io_manager_ptr_->readLayerToHost(l_info.start_offset, l_info.size_bytes, h_cpu_layers_[i].get())) {
+                throw std::runtime_error("Failed to read layer " + std::to_string(num_gpu_resident_layers_ + i));
+            }
+        }
+        const int kv_dim = num_kv_heads_ * head_dim_;
+        cpu_k_cache_.assign((size_t)num_streamed * max_ctx_ * kv_dim, 0.0f);
+        cpu_v_cache_.assign((size_t)num_streamed * max_ctx_ * kv_dim, 0.0f);
+        CUDA_CHECK(cudaMallocHost((void**)&h_act_pinned_, hidden_dim_ * sizeof(half)));
+        cpu_x_.resize(hidden_dim_); cpu_norm_.resize(hidden_dim_); cpu_q_.resize(hidden_dim_);
+        cpu_k_.resize(kv_dim); cpu_v_.resize(kv_dim); cpu_attn_.resize(hidden_dim_); cpu_o_.resize(hidden_dim_);
+        cpu_gate_.resize(max_intermediate_size_); cpu_up_.resize(max_intermediate_size_); cpu_down_.resize(hidden_dim_);
+        if (cpu_threads <= 0) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            // Measured on a 6-core/12-thread Ryzen 5600X: 8 threads read ~34 GB/s
+            // (6: ~29, 12: ~33). Default to 2/3 of the logical CPUs.
+            cpu_threads = hw >= 3 ? (int)(hw * 2 / 3) : 1;
+        }
+        cpu_pool_.reset(new friday_cpu::ThreadPool(cpu_threads));
+        printf("[Transformer] %d layers in host RAM (%.2f GB), computed on the CPU with %d threads (%s)\n",
+               num_streamed,
+               (double)(layers_info_.back().start_offset + layers_info_.back().size_bytes -
+                        layers_info_[num_gpu_resident_layers_].start_offset) / (1u << 30),
+               cpu_pool_->size(), friday_cpu::hasAvx2() ? "AVX2" : "scalar");
+    }
+
+    // 2b. Stream mode: DMA slots and pinned host cache for the streamed layers.
+    if (!cpu_offload_ && num_streamed > 0) {
         for (int i = 0; i < kDmaSlotCount; ++i) {
             CUDA_CHECK(cudaMalloc((void**)&d_layer_buffer_[i], layer_buffer_size_));
             CUDA_CHECK(cudaMemset(d_layer_buffer_[i], 0, layer_buffer_size_));
@@ -352,11 +472,13 @@ Transformer::~Transformer() {
     }
 
     if (d_token_embd_) CUDA_CHECK(cudaFree(d_token_embd_));
+    if (h_emb_row_pinned_) CUDA_CHECK(cudaFreeHost(h_emb_row_pinned_));
     if (d_output_norm_) CUDA_CHECK(cudaFree(d_output_norm_));
     if (d_lm_head_) CUDA_CHECK(cudaFree(d_lm_head_));
     if (d_k_cache_) CUDA_CHECK(cudaFree(d_k_cache_));
     if (d_v_cache_) CUDA_CHECK(cudaFree(d_v_cache_));
     if (d_attn_ctx_) CUDA_CHECK(cudaFree(d_attn_ctx_));
+    if (h_act_pinned_) CUDA_CHECK(cudaFreeHost(h_act_pinned_));
     
     if (stream_compute_) CUDA_CHECK(cudaStreamDestroy(stream_compute_));
     if (stream_io_) CUDA_CHECK(cudaStreamDestroy(stream_io_));
@@ -698,7 +820,7 @@ void Transformer::applyGeLU(half* d_activations, int size, cudaStream_t stream) 
 }
 
 bool Transformer::getEmbedding(int token_id, half* d_output, int vocab_size, cudaStream_t stream) {
-    if (!d_token_embd_) return false;
+    if (!h_token_embd_) return false;
     std::string embed_name = "token_embd.weight";
     if (!full_tensor_map_.count(embed_name)) {
         embed_name = "model.embed_tokens.weight";
@@ -708,31 +830,27 @@ bool Transformer::getEmbedding(int token_id, half* d_output, int vocab_size, cud
 
     if (token_id < 0 || token_id >= vocab_size) token_id = 151643;
 
-    if (t_info.dtype == "Q4_0") {
-        int row_size_bytes = (hidden_dim_ / 32) * 18;
-        size_t offset = (size_t)token_id * row_size_bytes;
-        const uint8_t* d_row_ptr = (const uint8_t*)d_token_embd_ + offset;
-        int threads = 256;
-        int blocks = (hidden_dim_ + threads - 1) / threads;
-        dequantize_q4_0_row_kernel<<<blocks, threads, 0, stream>>>(d_row_ptr, d_output, hidden_dim_);
-        CUDA_CHECK(cudaGetLastError());
-        return true;
-    }
-    if (t_info.dtype == "Q2_K") {
-        const size_t row_bytes = (size_t)(hidden_dim_ / 256) * 84;
-        const uint8_t* d_row = (const uint8_t*)d_token_embd_ + (size_t)token_id * row_bytes;
-        dequantize_q2_K_row_kernel<<<(hidden_dim_ + 255) / 256, 256, 0, stream>>>(d_row, d_output, hidden_dim_);
-        CUDA_CHECK(cudaGetLastError());
-        return true;
-    }
-    if (t_info.dtype != "F16") {
+    const size_t row_bytes = embeddingRowBytes(t_info.dtype, hidden_dim_);
+    if (row_bytes == 0) {
         // Previously every other dtype was copied as raw FP16, which read out of bounds.
         fprintf(stderr, "getEmbedding: unsupported embedding dtype '%s'\n", t_info.dtype.c_str());
         return false;
     }
+    if ((size_t)(token_id + 1) * row_bytes > t_info.size_bytes) {
+        fprintf(stderr, "getEmbedding: token %d is outside the embedding table\n", token_id);
+        return false;
+    }
 
-    size_t offset = (size_t)token_id * hidden_dim_ * sizeof(half);
-    CUDA_CHECK(cudaMemcpyAsync(d_output, (const char*)d_token_embd_ + offset, hidden_dim_ * sizeof(half), cudaMemcpyDeviceToDevice, stream));
+    // Stage this token's quantized row: host table -> pinned buffer -> device row
+    // buffer, then dequantize on the GPU exactly as before. The sync makes sure the
+    // previous copy out of the pinned buffer has finished.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::memcpy(h_emb_row_pinned_, h_token_embd_.get() + (size_t)token_id * row_bytes, row_bytes);
+    CUDA_CHECK(cudaMemcpyAsync(d_token_embd_, h_emb_row_pinned_, row_bytes, cudaMemcpyHostToDevice, stream));
+    if (!launchDequantizeRow(t_info.dtype, (const uint8_t*)d_token_embd_, d_output, hidden_dim_, stream)) {
+        fprintf(stderr, "getEmbedding: dequantization launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
     return true;
 }
 
@@ -820,8 +938,28 @@ void Transformer::forward(
         }
     }
 
-    // 2. Kalan stream edilecek katmanlar (num_gpu_resident_layers_ .. num_layers_ - 1)
-    if (num_gpu_resident_layers_ < num_layers_) {
+    // 2a. CPU-offload mode: hand the hidden state to the CPU, run the remaining
+    // layers there, and copy it back for the final norm and LM head.
+    if (cpu_offload_ && num_gpu_resident_layers_ < num_layers_) {
+        if (seq_len != 1) throw std::runtime_error("CPU layers: only single-token decode is supported");
+        if (pos_offset < 0 || pos_offset >= max_ctx_) {
+            throw std::runtime_error("context length exceeded: position " + std::to_string(pos_offset) +
+                                     " >= max context " + std::to_string(max_ctx_));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(h_act_pinned_, d_input_activations, hidden_dim_ * sizeof(half),
+                                   cudaMemcpyDeviceToHost, compute_stream));
+        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        const uint16_t* hb = reinterpret_cast<const uint16_t*>(h_act_pinned_);
+        for (int i = 0; i < hidden_dim_; ++i) cpu_x_[i] = friday_cpu::halfToFloat(hb[i]);
+        forwardCpuLayers(pos_offset);
+        uint16_t* ho = reinterpret_cast<uint16_t*>(h_act_pinned_);
+        for (int i = 0; i < hidden_dim_; ++i) ho[i] = friday_cpu::floatToHalf(cpu_x_[i]);
+        CUDA_CHECK(cudaMemcpyAsync(d_input_activations, h_act_pinned_, hidden_dim_ * sizeof(half),
+                                   cudaMemcpyHostToDevice, compute_stream));
+    }
+
+    // 2b. Stream mode: remaining layers streamed over PCIe (num_gpu_resident_layers_ .. num_layers_ - 1)
+    if (!cpu_offload_ && num_gpu_resident_layers_ < num_layers_) {
         const int first_stream_layer = num_gpu_resident_layers_;
 
         // Issue the host->device copy of streamed layer `offload_idx` into DMA slot `slot`
@@ -953,4 +1091,73 @@ void Transformer::forward(
     }
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+}
+
+// ---------------------------------------------------------------------------
+// CPU-computed layers (CPU-offload mode). Same math as the GPU path: int8
+// activations for the K-quant GEMVs and fp16 rounding at the same points.
+// ---------------------------------------------------------------------------
+void Transformer::forwardCpuLayers(int pos) {
+    for (int l = num_gpu_resident_layers_; l < num_layers_; ++l) cpuLayer(l, pos);
+}
+
+void Transformer::cpuLayer(int layer_idx, int pos) {
+    using namespace friday_cpu;
+    const int ci = layer_idx - num_gpu_resident_layers_;
+    const unsigned char* base = h_cpu_layers_[ci].get();
+    const auto& li = layers_info_[layer_idx];
+    const std::string pre = "blk." + std::to_string(layer_idx) + ".";
+    const int H = hidden_dim_, kv_dim = num_kv_heads_ * head_dim_;
+
+    auto ptr = [&](const char* n) { return base + li.tensor_rel_offsets.at(pre + n); };
+    auto gemv = [&](const char* n, const Q8Activation& xa, float* y) {
+        const TensorInfo& ti = full_tensor_map_.at(pre + n);
+        const int K = (int)ti.shape[0], N = (int)ti.shape[1];
+        KQuant t;
+        if (ti.dtype == "Q2_K") t = KQuant::Q2_K;
+        else if (ti.dtype == "Q3_K") t = KQuant::Q3_K;
+        else if (ti.dtype == "Q4_K") t = KQuant::Q4_K;
+        else throw std::runtime_error("CPU layers: unsupported weight type " + ti.dtype + " for " + pre + n);
+        if (xa.K != K) throw std::runtime_error("CPU layers: shape mismatch for " + pre + n);
+        const uint8_t* W = ptr(n);
+        cpu_pool_->parallelFor(N, 32, [&](int b, int e) { gemvRows(t, W, xa, y, b, e); });
+        roundToHalf(y, N);
+        return N;
+    };
+    auto addBias = [&](const char* n, float* y, int N) {
+        if (!li.tensor_rel_offsets.count(pre + n)) return;
+        const float* b = reinterpret_cast<const float*>(ptr(n));
+        for (int i = 0; i < N; ++i) y[i] += std::isnan(b[i]) ? 0.0f : b[i];
+        roundToHalf(y, N);
+    };
+
+    Q8Activation xa;
+    // Attention block
+    rmsNorm(cpu_x_.data(), reinterpret_cast<const float*>(ptr("attn_norm.weight")), cpu_norm_.data(), H,
+            rms_norm_epsilon_);
+    quantizeActivation(cpu_norm_.data(), H, xa);
+    addBias("attn_q.bias", cpu_q_.data(), gemv("attn_q.weight", xa, cpu_q_.data()));
+    addBias("attn_k.bias", cpu_k_.data(), gemv("attn_k.weight", xa, cpu_k_.data()));
+    addBias("attn_v.bias", cpu_v_.data(), gemv("attn_v.weight", xa, cpu_v_.data()));
+    ropeNeox(cpu_q_.data(), cpu_k_.data(), head_dim_, num_heads_, num_kv_heads_, pos);
+    float* k_layer = cpu_k_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;
+    float* v_layer = cpu_v_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;
+    std::memcpy(k_layer + (size_t)pos * kv_dim, cpu_k_.data(), kv_dim * sizeof(float));
+    std::memcpy(v_layer + (size_t)pos * kv_dim, cpu_v_.data(), kv_dim * sizeof(float));
+    decodeAttention(cpu_q_.data(), k_layer, v_layer, cpu_attn_.data(), pos + 1, num_heads_, num_kv_heads_,
+                    head_dim_, *cpu_pool_);
+    quantizeActivation(cpu_attn_.data(), H, xa);
+    gemv("attn_output.weight", xa, cpu_o_.data());
+    addResidual(cpu_x_.data(), cpu_o_.data(), H);
+
+    // MLP block (SwiGLU)
+    rmsNorm(cpu_x_.data(), reinterpret_cast<const float*>(ptr("ffn_norm.weight")), cpu_norm_.data(), H,
+            rms_norm_epsilon_);
+    quantizeActivation(cpu_norm_.data(), H, xa);
+    const int I = gemv("ffn_gate.weight", xa, cpu_gate_.data());
+    gemv("ffn_up.weight", xa, cpu_up_.data());
+    siluMul(cpu_gate_.data(), cpu_up_.data(), I);
+    quantizeActivation(cpu_gate_.data(), I, xa);
+    gemv("ffn_down.weight", xa, cpu_down_.data());
+    addResidual(cpu_x_.data(), cpu_down_.data(), H);
 }

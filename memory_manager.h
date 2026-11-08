@@ -9,6 +9,7 @@
 #include <map> // Bellek bloklarını takip etmek için
 
 // Hata kontrol makrosu
+#ifndef CUDA_CHECK
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -17,6 +18,7 @@
             throw std::runtime_error(cudaGetErrorString(err)); \
         } \
     } while (0)
+#endif
 
 // ZeroCopyMemoryManager sınıfı, pinned (sayfalanmayan) bellek tahsisi ve yönetimini yapar.
 class ZeroCopyMemoryManager {

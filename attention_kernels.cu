@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 
 namespace friday_attn {
 namespace {
@@ -119,6 +120,9 @@ void launchDecodeAttention(const half* q, const half* k_cache, const half* v_cac
     if (smem > 48 * 1024) throw std::runtime_error("launchDecodeAttention: seq_len exceeds shared-memory limit");
     decodeAttentionKernel<<<num_heads, kThreads, smem, stream>>>(q, k_cache, v_cache, out, seq_len, num_heads,
                                                                  num_kv_heads);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("launchDecodeAttention: launch failed: ") + cudaGetErrorString(err));
 }
 
 }  // namespace friday_attn
