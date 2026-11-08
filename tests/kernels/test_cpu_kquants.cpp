@@ -52,8 +52,9 @@ int main(int argc, char** argv) {
     ThreadPool pool(4);
     for (const auto& m : meta) {
         const std::string c = m["case"];
-        if (c != "q2_k" && c != "q3_k" && c != "q4_k") continue;
-        const KQuant t = c == "q2_k" ? KQuant::Q2_K : c == "q3_k" ? KQuant::Q3_K : KQuant::Q4_K;
+        if (c.rfind("emb_", 0) == 0) continue;
+        const KQuant t = c == "q2_k" ? KQuant::Q2_K : c == "q3_k" ? KQuant::Q3_K : c == "q4_k" ? KQuant::Q4_K
+                       : c == "q5_k" ? KQuant::Q5_K : c == "q8_0" ? KQuant::Q8_0 : KQuant::Q6_K;
         const int K = m["K"], N = m["N"];
         auto w = readFile<uint8_t>(dir + "/" + c + "_w.bin");
         auto xh = readFile<uint16_t>(dir + "/" + c + "_x.bin");

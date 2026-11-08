@@ -2,6 +2,7 @@
 #include "attention_kernels.h"
 #include "cpu_kquants.h"
 #include "gguf_file.h"
+#include "model_config.h"
 #include <algorithm>
 #include "cpu_ops.h"
 #include "cpu_threadpool.h"
@@ -18,7 +19,8 @@
 
 // --- CUDA Kernel Declarations ---
 __global__ void rmsNormKernel(half* d_input, const float* d_weight, half* d_output, int size, float epsilon);
-__global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, int num_q_heads, int num_kv_heads);
+__global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, int num_q_heads,
+                           int num_kv_heads, float freq_base, int neox, const float* freq_factors);
 __global__ void geluKernel(half* d_activations, int size);
 __global__ void elementWiseMulKernel(half* d_a, const half* d_b, int size);
 __global__ void addResidualKernel(half* d_target, const half* d_addend, int size);
@@ -134,6 +136,31 @@ __global__ void dequantize_q6_K_row_kernel(const uint8_t* row, half* out, int di
     out[idx] = __float2half(d * (float)sc * (float)q);
 }
 
+__global__ void dequantize_q5_K_row_kernel(const uint8_t* row, half* out, int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    const uint8_t* b = row + (idx / 256) * 176;   // d dmin scales[12] qh[32] qs[128]
+    const int r = idx % 256, j = r / 64, hi = (r % 64) / 32, l = r % 32;
+    const int is = 2 * j + hi;
+    const uint8_t* q = b + 4;
+    int sc, m;
+    if (is < 4) { sc = q[is] & 63; m = q[is + 4] & 63; }
+    else { sc = (q[is + 4] & 0xF) | ((q[is - 4] >> 6) << 4); m = (q[is + 4] >> 4) | ((q[is] >> 6) << 4); }
+    const uint8_t qb = b[48 + 32 * j + l];
+    const int v = (hi ? (qb >> 4) : (qb & 0xF)) + (((b[16 + l] >> is) & 1) << 4);
+    const float d = __half2float(*reinterpret_cast<const half*>(b));
+    const float dmin = __half2float(*reinterpret_cast<const half*>(b + 2));
+    out[idx] = __float2half(d * (float)sc * (float)v - dmin * (float)m);
+}
+
+__global__ void dequantize_q8_0_row_kernel(const uint8_t* row, half* out, int dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+    const uint8_t* b = row + (idx / 32) * 34;    // fp16 d, int8 qs[32]
+    const float d = __half2float(*reinterpret_cast<const half*>(b));
+    out[idx] = __float2half(d * (float)reinterpret_cast<const int8_t*>(b + 2)[idx % 32]);
+}
+
 bool launchDequantizeRow(const std::string& dtype, const uint8_t* d_row, half* d_out, int dim, cudaStream_t s) {
     const int threads = 256, blocks = (dim + threads - 1) / threads;
     if (dtype == "Q4_0") dequantize_q4_0_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
@@ -141,6 +168,8 @@ bool launchDequantizeRow(const std::string& dtype, const uint8_t* d_row, half* d
     else if (dtype == "Q3_K") dequantize_q3_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
     else if (dtype == "Q4_K") dequantize_q4_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
     else if (dtype == "Q6_K") dequantize_q6_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "Q5_K") dequantize_q5_K_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
+    else if (dtype == "Q8_0") dequantize_q8_0_row_kernel<<<blocks, threads, 0, s>>>(d_row, d_out, dim);
     else if (dtype == "F16") return cudaMemcpyAsync(d_out, d_row, (size_t)dim * sizeof(half), cudaMemcpyDeviceToDevice, s) == cudaSuccess;
     else return false;
     return cudaGetLastError() == cudaSuccess;
@@ -152,6 +181,8 @@ size_t embeddingRowBytes(const std::string& dtype, int dim) {
     if (dtype == "Q3_K") return (size_t)(dim / 256) * 110;
     if (dtype == "Q4_K") return (size_t)(dim / 256) * 144;
     if (dtype == "Q6_K") return (size_t)(dim / 256) * 210;
+    if (dtype == "Q5_K") return (size_t)(dim / 256) * 176;
+    if (dtype == "Q8_0") return (size_t)(dim / 32) * 34;
     if (dtype == "F16") return (size_t)dim * sizeof(half);
     return 0;
 }
@@ -166,6 +197,7 @@ QuantType Transformer::getQuantTypeFromDtype(const std::string& dtype_str) {
     if (dtype_str == "Q2_K") return Q2_K;
     if (dtype_str == "Q3_K") return Q3_K;
     if (dtype_str == "Q4_K") return Q4_K;
+    if (dtype_str == "Q5_K") return Q5_K;
     return UNKNOWN;
 }
 
@@ -268,6 +300,20 @@ Transformer::Transformer(
             fprintf(stderr, "Hata: '%s' tensörü okunamadi!\n", emb_name.c_str());
             exit(EXIT_FAILURE);
         }
+    }
+
+    // Llama 3 RoPE frequency factors (F32 [head_dim / 2]), if the model has them.
+    if (full_tensor_map_.count("rope_freqs.weight")) {
+        const auto& info = full_tensor_map_.at("rope_freqs.weight");
+        if (info.dtype != "F32" || info.size_bytes != (size_t)(head_dim_ / 2) * sizeof(float))
+            throw std::runtime_error("rope_freqs.weight: expected F32 [head_dim / 2]");
+        h_rope_freqs_.resize(head_dim_ / 2);
+        if (!async_io_manager_ptr_->readLayerToHost(info.absolute_offset, info.size_bytes,
+                                                    reinterpret_cast<unsigned char*>(h_rope_freqs_.data())))
+            throw std::runtime_error("cannot read rope_freqs.weight");
+        CUDA_CHECK(cudaMalloc((void**)&d_rope_freqs_, info.size_bytes));
+        CUDA_CHECK(cudaMemcpy(d_rope_freqs_, h_rope_freqs_.data(), info.size_bytes, cudaMemcpyHostToDevice));
+        printf("[Transformer] RoPE frequency factors loaded (%d)\n", head_dim_ / 2);
     }
 
     std::string norm_name = "output_norm.weight";
@@ -486,6 +532,7 @@ Transformer::~Transformer() {
     if (d_k_cache_) CUDA_CHECK(cudaFree(d_k_cache_));
     if (d_v_cache_) CUDA_CHECK(cudaFree(d_v_cache_));
     if (d_attn_ctx_) CUDA_CHECK(cudaFree(d_attn_ctx_));
+    if (d_rope_freqs_) CUDA_CHECK(cudaFree(d_rope_freqs_));
     if (h_act_pinned_) CUDA_CHECK(cudaFreeHost(h_act_pinned_));
     
     if (stream_compute_) CUDA_CHECK(cudaStreamDestroy(stream_compute_));
@@ -530,6 +577,9 @@ void Transformer::loadTensorMap(const std::string& map_path) {
 
 void Transformer::loadTensorsFromGguf(const std::string& gguf_path) {
     const friday::GgufFile g(gguf_path);
+    const friday::ModelConfig cfg = friday::ModelConfig::fromGguf(g);
+    rope_freq_base_ = cfg.rope_freq_base;
+    rope_neox_ = cfg.ropeNeox();
     for (const auto& t : g.tensors()) {
         const char* type_name = friday::ggmlTypeName(t.type);
         TensorInfo info;
@@ -642,7 +692,10 @@ void Transformer::applyRoPE(
         seq_len,
         pos_offset,
         num_heads_,
-        num_kv_heads_
+        num_kv_heads_,
+        rope_freq_base_,
+        rope_neox_ ? 1 : 0,
+        d_rope_freqs_
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1156,6 +1209,9 @@ void Transformer::cpuLayer(int layer_idx, int pos) {
         if (ti.dtype == "Q2_K") t = KQuant::Q2_K;
         else if (ti.dtype == "Q3_K") t = KQuant::Q3_K;
         else if (ti.dtype == "Q4_K") t = KQuant::Q4_K;
+        else if (ti.dtype == "Q6_K") t = KQuant::Q6_K;
+        else if (ti.dtype == "Q5_K") t = KQuant::Q5_K;
+        else if (ti.dtype == "Q8_0") t = KQuant::Q8_0;
         else throw std::runtime_error("CPU layers: unsupported weight type " + ti.dtype + " for " + pre + n);
         if (xa.K != K) throw std::runtime_error("CPU layers: shape mismatch for " + pre + n);
         const uint8_t* W = ptr(n);
@@ -1178,7 +1234,8 @@ void Transformer::cpuLayer(int layer_idx, int pos) {
     addBias("attn_q.bias", cpu_q_.data(), gemv("attn_q.weight", xa, cpu_q_.data()));
     addBias("attn_k.bias", cpu_k_.data(), gemv("attn_k.weight", xa, cpu_k_.data()));
     addBias("attn_v.bias", cpu_v_.data(), gemv("attn_v.weight", xa, cpu_v_.data()));
-    ropeNeox(cpu_q_.data(), cpu_k_.data(), head_dim_, num_heads_, num_kv_heads_, pos);
+    rope(cpu_q_.data(), cpu_k_.data(), head_dim_, num_heads_, num_kv_heads_, pos, rope_freq_base_, rope_neox_,
+         h_rope_freqs_.empty() ? nullptr : h_rope_freqs_.data());
     float* k_layer = cpu_k_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;
     float* v_layer = cpu_v_cache_.data() + (size_t)ci * max_ctx_ * kv_dim;
     std::memcpy(k_layer + (size_t)pos * kv_dim, cpu_k_.data(), kv_dim * sizeof(float));

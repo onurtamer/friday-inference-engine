@@ -167,6 +167,9 @@ size_t rowBytes(KQuant t, int K) {
         case KQuant::Q2_K: return nb * 84;
         case KQuant::Q3_K: return nb * 110;
         case KQuant::Q4_K: return nb * 144;
+        case KQuant::Q6_K: return nb * 210;
+        case KQuant::Q5_K: return nb * 176;
+        case KQuant::Q8_0: return (size_t)K / 32 * 34;
     }
     return 0;
 }
@@ -277,6 +280,78 @@ static float dotQ4KScalar(const uint8_t* row, const Q8Activation& x, int nb) {
     return acc;
 }
 
+// Q6_K: ql[128] qh[64] int8 scales[16] fp16 d. For half h and l in 0..31 the
+// four values at h*128 + 32p + l (p = 0..3) use ql[h*64 + l + 32*(p&1)]
+// (low nibble for p < 2, high for p >= 2), 2 bits of qh[h*32 + l] at 2p, and
+// scale h*8 + 2p + l/16; value = q - 32.
+static float dotQ6KScalar(const uint8_t* row, const Q8Activation& x, int nb) {
+    float acc = 0.0f;
+    for (int sb = 0; sb < nb; ++sb) {
+        const uint8_t* b = row + sb * 210;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192);
+        const float d = f16(b + 208);
+        float sd = 0.0f;
+        for (int h = 0; h < 2; ++h)
+            for (int p = 0; p < 4; ++p)
+                for (int c = 0; c < 2; ++c) {
+                    const int pos = sb * 256 + h * 128 + p * 32 + c * 16;
+                    int dot = 0;
+                    for (int i = 0; i < 16; ++i) {
+                        const int l = c * 16 + i;
+                        const uint8_t qlb = b[h * 64 + l + 32 * (p & 1)];
+                        const int lo = p < 2 ? (qlb & 0xF) : (qlb >> 4);
+                        const int q = (lo | (((b[128 + h * 32 + l] >> (2 * p)) & 3) << 4)) - 32;
+                        dot += q * x.q[pos + i];
+                    }
+                    sd += x.d[pos / 32] * (float)(dot * sc[h * 8 + 2 * p + c]);
+                }
+        acc += d * sd;
+    }
+    return acc;
+}
+
+static float dotQ5KScalar(const uint8_t* row, const Q8Activation& x, int nb) {
+    float acc = 0.0f;
+    for (int sb = 0; sb < nb; ++sb) {
+        const uint8_t* b = row + sb * 176;
+        const float d = f16(b), dmin = f16(b + 2);
+        const uint8_t* scl = b + 4;
+        const uint8_t* qh = b + 16;
+        const uint8_t* qs = b + 48;
+        float sd = 0.0f, sm = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            int s_lo, m_lo, s_hi, m_hi;
+            q4kScaleMin(2 * j, scl, s_lo, m_lo);
+            q4kScaleMin(2 * j + 1, scl, s_hi, m_hi);
+            const int pos = sb * 256 + 64 * j;
+            int dlo = 0, dhi = 0;
+            for (int l = 0; l < 32; ++l) {
+                dlo += ((qs[32 * j + l] & 0xF) | (((qh[l] >> (2 * j)) & 1) << 4)) * x.q[pos + l];
+                dhi += ((qs[32 * j + l] >> 4) | (((qh[l] >> (2 * j + 1)) & 1) << 4)) * x.q[pos + 32 + l];
+            }
+            const int bs_lo = x.bsum16[pos / 16] + x.bsum16[pos / 16 + 1];
+            const int bs_hi = x.bsum16[pos / 16 + 2] + x.bsum16[pos / 16 + 3];
+            const float d8lo = x.d[pos / 32], d8hi = x.d[pos / 32 + 1];
+            sd += d8lo * (float)(dlo * s_lo) + d8hi * (float)(dhi * s_hi);
+            sm += d8lo * (float)(bs_lo * m_lo) + d8hi * (float)(bs_hi * m_hi);
+        }
+        acc += d * sd - dmin * sm;
+    }
+    return acc;
+}
+
+static float dotQ80Scalar(const uint8_t* row, const Q8Activation& x, int nblk) {
+    float acc = 0.0f;
+    for (int bk = 0; bk < nblk; ++bk) {
+        const uint8_t* b = row + bk * 34;
+        const int8_t* q = reinterpret_cast<const int8_t*>(b + 2);
+        int dot = 0;
+        for (int i = 0; i < 32; ++i) dot += q[i] * x.q[bk * 32 + i];
+        acc += f16(b) * x.d[bk] * (float)dot;
+    }
+    return acc;
+}
+
 void gemvRowsScalar(KQuant t, const uint8_t* W, const Q8Activation& x, float* y, int r0, int r1) {
     const int nb = x.K / 256;
     const size_t rb = rowBytes(t, x.K);
@@ -286,6 +361,9 @@ void gemvRowsScalar(KQuant t, const uint8_t* W, const Q8Activation& x, float* y,
             case KQuant::Q2_K: y[r] = dotQ2KScalar(row, x, nb); break;
             case KQuant::Q3_K: y[r] = dotQ3KScalar(row, x, nb); break;
             case KQuant::Q4_K: y[r] = dotQ4KScalar(row, x, nb); break;
+            case KQuant::Q6_K: y[r] = dotQ6KScalar(row, x, nb); break;
+            case KQuant::Q5_K: y[r] = dotQ5KScalar(row, x, nb); break;
+            case KQuant::Q8_0: y[r] = dotQ80Scalar(row, x, x.K / 32); break;
         }
     }
 }
@@ -436,6 +514,93 @@ static float dotQ4KAvx2(const uint8_t* row, const Q8Activation& x, int nb) {
     }
     return hsum256(acc);
 }
+static float dotQ6KAvx2(const uint8_t* row, const Q8Activation& x, int nb) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i ctl[4] = {pairControl(0), pairControl(1), pairControl(2), pairControl(3)};
+    __m256 acc = _mm256_setzero_ps();
+    for (int sb = 0; sb < nb; ++sb) {
+        const uint8_t* b = row + sb * 210;
+        const float d = f16c(b + 208);
+        const int8_t* xq = x.q.data() + sb * 256;
+        const __m256 xd = _mm256_loadu_ps(x.d.data() + sb * 8);
+        const __m128i sc8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 192));
+        // -32 offset of every weight: lane k = sum over the two groups of block k of sc_g * bsum_g
+        const __m256i bs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.bsum16.data() + sb * 16));
+        const __m256i osum = _mm256_madd_epi16(_mm256_cvtepi8_epi16(sc8), bs);
+        __m256i blk[8];
+        for (int h = 0; h < 2; ++h) {
+            const __m256i ql0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + h * 64));
+            const __m256i ql1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + h * 64 + 32));
+            const __m256i qh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 128 + h * 32));
+            const __m256i sch = _mm256_broadcastsi128_si256(_mm_cvtepi8_epi16(h == 0 ? sc8 : _mm_srli_si128(sc8, 8)));
+            const __m256i lows[4] = {_mm256_and_si256(ql0, m4), _mm256_and_si256(ql1, m4),
+                                     _mm256_and_si256(_mm256_srli_epi16(ql0, 4), m4),
+                                     _mm256_and_si256(_mm256_srli_epi16(ql1, 4), m4)};
+            for (int p = 0; p < 4; ++p) {
+                const __m256i hi2 = _mm256_and_si256(_mm256_srli_epi16(qh, 2 * p), m3);
+                const __m256i v = _mm256_or_si256(lows[p], _mm256_slli_epi16(hi2, 4));  // q + 32, 0..63
+                const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + h * 128 + p * 32));
+                blk[h * 4 + p] = _mm256_madd_epi16(_mm256_maddubs_epi16(v, xv), _mm256_shuffle_epi8(sch, ctl[p]));
+            }
+        }
+        const __m256i tot = _mm256_sub_epi32(reduce8(blk), _mm256_slli_epi32(osum, 5));
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(tot), _mm256_mul_ps(xd, _mm256_set1_ps(d)), acc);
+    }
+    return hsum256(acc);
+}
+static float dotQ5KAvx2(const uint8_t* row, const Q8Activation& x, int nb) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const __m256i m1 = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (int sb = 0; sb < nb; ++sb) {
+        const uint8_t* b = row + sb * 176;
+        const float d = f16c(b), dmin = f16c(b + 2);
+        const uint8_t* scl = b + 4;
+        const int8_t* xq = x.q.data() + sb * 256;
+        const __m256 xd = _mm256_loadu_ps(x.d.data() + sb * 8);
+        const int16_t* bsp = x.bsum16.data() + sb * 16;
+        const __m256i qh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 16));
+        alignas(32) int32_t mterm[8];
+        __m256i blk[8];
+        for (int j = 0; j < 4; ++j) {
+            int s_lo, m_lo, s_hi, m_hi;
+            q4kScaleMin(2 * j, scl, s_lo, m_lo);
+            q4kScaleMin(2 * j + 1, scl, s_hi, m_hi);
+            mterm[2 * j] = m_lo * (bsp[4 * j] + bsp[4 * j + 1]);
+            mterm[2 * j + 1] = m_hi * (bsp[4 * j + 2] + bsp[4 * j + 3]);
+            const __m256i qv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 48 + 32 * j));
+            const __m256i hlo = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * j), m1), 4);
+            const __m256i hhi = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * j + 1), m1), 4);
+            const __m256i lo = _mm256_or_si256(_mm256_and_si256(qv, m4), hlo);
+            const __m256i hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qv, 4), m4), hhi);
+            const __m256i xl = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + 64 * j));
+            const __m256i xh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + 64 * j + 32));
+            blk[2 * j] = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, xl), _mm256_set1_epi16((short)s_lo));
+            blk[2 * j + 1] = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, xh), _mm256_set1_epi16((short)s_hi));
+        }
+        const __m256i main = reduce8(blk);
+        const __m256i mins = _mm256_load_si256(reinterpret_cast<const __m256i*>(mterm));
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(main), _mm256_mul_ps(xd, _mm256_set1_ps(d)), acc);
+        acc = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(mins), _mm256_mul_ps(xd, _mm256_set1_ps(dmin)), acc);
+    }
+    return hsum256(acc);
+}
+
+static float dotQ80Avx2(const uint8_t* row, const Q8Activation& x, int nblk) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (int bk = 0; bk < nblk; ++bk) {
+        const uint8_t* b = row + bk * 34;
+        const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2));
+        const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.q.data() + bk * 32));
+        // signed x signed via |w| * sign(x, w)
+        const __m256i p = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(xv, w));
+        const __m256i i32 = _mm256_madd_epi16(p, ones);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i32), _mm256_set1_ps(f16c(b) * x.d[bk]), acc);
+    }
+    return hsum256(acc);
+}
 #endif  // __AVX2__
 
 void gemvRows(KQuant t, const uint8_t* W, const Q8Activation& x, float* y, int r0, int r1) {
@@ -450,6 +615,9 @@ void gemvRows(KQuant t, const uint8_t* W, const Q8Activation& x, float* y, int r
                 case KQuant::Q2_K: y[r] = dotQ2KAvx2(row, x, nb); break;
                 case KQuant::Q3_K: y[r] = dotQ3KAvx2(row, x, nb); break;
                 case KQuant::Q4_K: y[r] = dotQ4KAvx2(row, x, nb); break;
+                case KQuant::Q6_K: y[r] = dotQ6KAvx2(row, x, nb); break;
+                case KQuant::Q5_K: y[r] = dotQ5KAvx2(row, x, nb); break;
+                case KQuant::Q8_0: y[r] = dotQ80Avx2(row, x, x.K / 32); break;
             }
         }
         return;

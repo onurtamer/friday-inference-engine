@@ -23,22 +23,19 @@ void rmsNorm(const float* x, const float* w, float* out, int n, float eps) {
     roundToHalf(out, n);
 }
 
-void ropeNeox(float* q, float* k, int head_dim, int nq, int nk, int pos) {
+void rope(float* q, float* k, int head_dim, int nq, int nk, int pos, float freq_base, bool neox,
+          const float* freq_factors) {
     const int half_dim = head_dim / 2;
     for (int i = 0; i < half_dim; ++i) {
-        const float theta = (float)pos / std::pow(1000000.0f, (2.0f * (float)i) / (float)head_dim);
+        float theta = (float)pos / std::pow(freq_base, (2.0f * (float)i) / (float)head_dim);
+        if (freq_factors) theta /= freq_factors[i];
         const float c = std::cos(theta), s = std::sin(theta);
-        for (int h = 0; h < nq; ++h) {
-            float* p = q + h * head_dim;
-            const float a = p[i], b = p[i + half_dim];
-            p[i] = a * c - b * s;
-            p[i + half_dim] = a * s + b * c;
-        }
-        for (int h = 0; h < nk; ++h) {
-            float* p = k + h * head_dim;
-            const float a = p[i], b = p[i + half_dim];
-            p[i] = a * c - b * s;
-            p[i + half_dim] = a * s + b * c;
+        const int o0 = neox ? i : 2 * i, o1 = neox ? i + half_dim : 2 * i + 1;
+        for (int h = 0; h < nq + nk; ++h) {
+            float* p = h < nq ? q + h * head_dim : k + (h - nq) * head_dim;
+            const float a = p[o0], b = p[o1];
+            p[o0] = a * c - b * s;
+            p[o1] = a * s + b * c;
         }
     }
     roundToHalf(q, nq * head_dim);

@@ -1,0 +1,7 @@
+{
+  "temperature": 0.0,
+  "sampling_mode": "greedy",
+  "seed": 42,
+  "max_new_tokens": 32,
+  "eos_token_id": 128009
+}

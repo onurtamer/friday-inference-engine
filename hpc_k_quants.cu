@@ -545,6 +545,118 @@ void q4_K_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict
     if (lane == 0) y[row] = __float2half(acc);
 }
 
+// Q6_K x int8: ql[128] qh[64] int8 scales[16] fp16 d (210 B, 2-byte aligned).
+// Lane mapping as Q2_K/Q3_K: h = half, m = 4-byte column; per p = 0..3 the
+// lane's 4 values sit at h*128 + 32p + 4m, scale h*8 + 2p + c.
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void q6_K_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                         const float* __restrict__ xd, half* __restrict__ y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nb = K / QK_K;
+    const uint8_t* __restrict__ wr = W + (size_t)row * nb * 210;
+    const int hl = lane & 15, h = hl >> 3, m = hl & 7, c = m >> 2;
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nb; sb += 2) {
+        const uint8_t* b = wr + sb * 210;
+        const uint32_t ql0 = load_u32_a2(b + h * 64 + 4 * m);
+        const uint32_t ql1 = load_u32_a2(b + h * 64 + 32 + 4 * m);
+        const uint32_t qh = load_u32_a2(b + 128 + h * 32 + 4 * m);
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + h * 8 + c;
+        const float d = __half2float(*reinterpret_cast<const half*>(b + 208));
+        const int8_t* xb = xq + sb * QK_K + h * 128 + 4 * m;
+        const float* d8 = xd + sb * 8 + h * 4;
+        float sd = 0.0f;
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const uint32_t qlw = (p & 1) ? ql1 : ql0;
+            const uint32_t lo = (p < 2 ? qlw : (qlw >> 4)) & 0x0F0F0F0Fu;
+            const int v = (int)(lo | (((qh >> (2 * p)) & 0x03030303u) << 4));  // q + 32, 0..63
+            const int xv = *reinterpret_cast<const int*>(xb + p * 32);
+            const int dot = __dp4a(v, xv, 0) - 32 * __dp4a(0x01010101, xv, 0);
+            sd += d8[p] * (float)(dot * (int)sc[2 * p]);
+        }
+        acc += d * sd;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+// Q5_K x int8: d dmin scales[12] qh[32] qs[128] (176 B, 16-byte aligned).
+// Chunk j (64 values): low nibbles + bit 2j of qh -> values 64j + l, high
+// nibbles + bit 2j+1 -> 64j + 32 + l. Lane mapping as Q4_K.
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void q5_K_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                         const float* __restrict__ xd, half* __restrict__ y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nb = K / QK_K;
+    const uint8_t* __restrict__ wr = W + (size_t)row * nb * 176;
+    const int hl = lane & 15, j = hl >> 2, m = hl & 3;
+    float acc = 0.0f;
+    for (int sb = lane >> 4; sb < nb; sb += 2) {
+        const uint8_t* b = wr + sb * 176;
+        const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
+        const uint8_t* sc = b + 4;
+        const uint2 qh = *reinterpret_cast<const uint2*>(b + 16 + 8 * m);
+        const uint2 qq = *reinterpret_cast<const uint2*>(b + 48 + 32 * j + 8 * m);
+        int s_lo, m_lo, s_hi, m_hi;
+        {
+            const int is = 2 * j;
+            if (is < 4) { s_lo = sc[is] & 63; m_lo = sc[is + 4] & 63; }
+            else { s_lo = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); m_lo = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+            const int is1 = is + 1;
+            if (is1 < 4) { s_hi = sc[is1] & 63; m_hi = sc[is1 + 4] & 63; }
+            else { s_hi = (sc[is1 + 4] & 0xF) | ((sc[is1 - 4] >> 6) << 4); m_hi = (sc[is1 + 4] >> 4) | ((sc[is1] >> 6) << 4); }
+        }
+        const int8_t* xb = xq + sb * QK_K + 64 * j + 8 * m;
+        const int2 xl = *reinterpret_cast<const int2*>(xb);
+        const int2 xh = *reinterpret_cast<const int2*>(xb + 32);
+        const float2 d8 = *reinterpret_cast<const float2*>(xd + sb * 8 + 2 * j);
+        const int l0 = (int)((qq.x & 0x0F0F0F0Fu) | (((qh.x >> (2 * j)) & 0x01010101u) << 4));
+        const int l1 = (int)((qq.y & 0x0F0F0F0Fu) | (((qh.y >> (2 * j)) & 0x01010101u) << 4));
+        const int h0 = (int)(((qq.x >> 4) & 0x0F0F0F0Fu) | (((qh.x >> (2 * j + 1)) & 0x01010101u) << 4));
+        const int h1 = (int)(((qq.y >> 4) & 0x0F0F0F0Fu) | (((qh.y >> (2 * j + 1)) & 0x01010101u) << 4));
+        const int dot_lo = __dp4a(l1, xl.y, __dp4a(l0, xl.x, 0));
+        const int dot_hi = __dp4a(h1, xh.y, __dp4a(h0, xh.x, 0));
+        const int xs_lo = __dp4a(0x01010101, xl.y, __dp4a(0x01010101, xl.x, 0));
+        const int xs_hi = __dp4a(0x01010101, xh.y, __dp4a(0x01010101, xh.x, 0));
+        const float sd = d8.x * (float)(dot_lo * s_lo) + d8.y * (float)(dot_hi * s_hi);
+        const float sm = d8.x * (float)(xs_lo * m_lo) + d8.y * (float)(xs_hi * m_hi);
+        acc += dm.x * sd - dm.y * sm;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+// Q8_0 x int8: fp16 d + int8 qs[32] (34 B, 2-byte aligned). 4 lanes per block,
+// 8 values each; a warp covers 8 blocks per iteration.
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE)
+void q8_0_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                         const float* __restrict__ xd, half* __restrict__ y, int N, int K) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int nblk = K / 32;
+    const uint8_t* __restrict__ wr = W + (size_t)row * nblk * 34;
+    const int part = lane & 3;
+    float acc = 0.0f;
+    for (int bk = lane >> 2; bk < nblk; bk += 8) {
+        const uint8_t* b = wr + bk * 34;
+        const float d = __half2float(*reinterpret_cast<const half*>(b));
+        const int w0 = (int)load_u32_a2(b + 2 + 8 * part), w1 = (int)load_u32_a2(b + 6 + 8 * part);
+        const int2 xv = *reinterpret_cast<const int2*>(xq + bk * 32 + 8 * part);
+        acc += d * xd[bk] * (float)__dp4a(w1, xv.y, __dp4a(w0, xv.x, 0));
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
 // ----------------------------------------------------------------------------
 // 5. HOST LAUNCHERS & TELEMETRY INFRASTRUCTURE
 // ----------------------------------------------------------------------------
@@ -566,7 +678,7 @@ static float* g_xd = nullptr;
 static int g_xq_cap = 0;
 
 static void quantizeX(const half* x, int K, cudaStream_t s) {
-    if (K % QK_K != 0) { std::fprintf(stderr, "GEMV: K=%d is not a multiple of 256\n", K); std::abort(); }
+    if (K % 32 != 0) { std::fprintf(stderr, "GEMV: K=%d is not a multiple of 32\n", K); std::abort(); }
     if (K > g_xq_cap) {
         cudaStreamSynchronize(s);
         if (g_xq) { cudaFree(g_xq); cudaFree(g_xd); }
@@ -626,9 +738,18 @@ void launch_q4_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaSt
 }
 
 void launch_q6_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    if (!useFp32Gemv()) { launchQ8<q6_K_q8_gemv_kernel<kQ8WarpsPerBlock>>(x, W, y, K, N, s); return; }
     const dim3 grid((N + kWarpsPerBlock - 1) / kWarpsPerBlock);
     const dim3 block(kWarpsPerBlock * WARP_SIZE);
     hpc_q6_K_gemv_kernel<kWarpsPerBlock><<<grid, block, 0, s>>>(static_cast<const hpc_block_q6_K*>(W), x, y, N, K);
+}
+
+void launch_q5_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    launchQ8<q5_K_q8_gemv_kernel<kQ8WarpsPerBlock>>(x, W, y, K, N, s);
+}
+
+void launch_q8_0_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s) {
+    launchQ8<q8_0_q8_gemv_kernel<kQ8WarpsPerBlock>>(x, W, y, K, N, s);
 }
 
 } // namespace friday_hpc

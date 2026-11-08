@@ -22,7 +22,10 @@ LAYOUT = {
     "q3_k": (T.Q3_K, 110, [108]),      # hmask[32] qs[64] scales[12] d
     "q4_k": (T.Q4_K, 144, [0, 2]),     # d dmin scales[12] qs[128]
     "q6_k": (T.Q6_K, 210, [208]),      # ql[128] qh[64] scales[16] d
+    "q5_k": (T.Q5_K, 176, [0, 2]),     # d dmin scales[12] qh[32] qs[128]
+    "q8_0": (T.Q8_0, 34, [0]),         # d qs[32]; 32 values per block
 }
+VALUES_PER_BLOCK = {"q8_0": 32}
 
 
 def random_rows(block_bytes, scale_offsets, rows, blocks):
@@ -36,7 +39,7 @@ def random_rows(block_bytes, scale_offsets, rows, blocks):
 meta = []
 K, N = 1024, 64
 for case, (qtype, bb, offs) in LAYOUT.items():
-    w = random_rows(bb, offs, N, K // 256)
+    w = random_rows(bb, offs, N, K // VALUES_PER_BLOCK.get(case, 256))
     deq = quants.dequantize(w, qtype).astype(np.float64).reshape(N, K)
     x = rng.standard_normal(K).astype(np.float16)
     (deq @ x.astype(np.float64)).tofile(os.path.join(out, case + "_yref.bin"))
@@ -57,7 +60,7 @@ for case, (qtype, bb, offs) in LAYOUT.items():
 V, D = 32, 1024
 ids = [0, 7, 31]
 for case, (qtype, bb, offs) in LAYOUT.items():
-    table = random_rows(bb, offs, V, D // 256)
+    table = random_rows(bb, offs, V, D // VALUES_PER_BLOCK.get(case, 256))
     ref = quants.dequantize(np.ascontiguousarray(table[ids]), qtype).astype(np.float32).reshape(len(ids), D)
     table.tofile(os.path.join(out, "emb_" + case + "_table.bin"))
     ref.tofile(os.path.join(out, "emb_" + case + "_ref.bin"))

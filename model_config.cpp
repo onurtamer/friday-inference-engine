@@ -54,15 +54,12 @@ ModelConfig ModelConfig::fromGguf(const GgufFile& f) {
 }
 
 void ModelConfig::checkSupported() const {
-    // R2c adds llama / qwen3; until then only what the kernels implement today.
-    if (architecture != "qwen2")
-        throw std::runtime_error("unsupported architecture '" + architecture + "' (supported: qwen2)");
+    if (architecture != "qwen2" && architecture != "llama")
+        throw std::runtime_error("unsupported architecture '" + architecture + "' (supported: qwen2, llama)");
     if (head_dim != 128 || head_dim * num_heads != hidden_dim)
         throw std::runtime_error("unsupported head layout: head_dim " + std::to_string(head_dim) + " (need 128)");
     if (num_heads % num_kv_heads != 0) throw std::runtime_error("num_heads must be a multiple of num_kv_heads");
-    if (std::fabs(rope_freq_base - 1000000.0f) > 1.0f)
-        throw std::runtime_error("unsupported rope.freq_base " + std::to_string(rope_freq_base) +
-                                 " (kernels use 1e6; configurable RoPE comes with R2c)");
+    if (!(rope_freq_base > 1.0f)) throw std::runtime_error("invalid rope.freq_base");
 }
 
 }  // namespace friday

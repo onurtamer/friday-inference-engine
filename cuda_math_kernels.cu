@@ -297,57 +297,39 @@ __global__ void rmsNormKernel(half* d_input, const float* d_weight, half* d_outp
 
 // ============================================================
 // Rotary Position Embedding (RoPE) Kernel
-// Applies rotation to Q and K vectors for all attention heads.
-// Qwen2.5 uses NEOX RoPE (rotate_half) with rope_freq_base = 1,000,000.
+// Rotates Q and K for all heads at position pos_offset.
+//   neox = 1: pairs (i, i + head_dim/2)  (rotate_half; Qwen2)
+//   neox = 0: pairs (2i, 2i + 1)          (GGML "normal" mode; Llama)
+// theta_i = pos / base^(2i / head_dim), divided by freq_factors[i] when given
+// (Llama 3 rope_freqs.weight).
 // ============================================================
-__global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, int num_q_heads, int num_kv_heads) {
+__global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, int num_q_heads,
+                           int num_kv_heads, float freq_base, int neox, const float* freq_factors) {
     int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_head_dim = head_dim / 2;
 
     if (pair_idx >= half_head_dim) return;
 
-    // Position in the sequence
     float position = (float)pos_offset;
-
-    // Compute rotation angle: theta = pos / (base ^ (2*pair_idx / head_dim))
-    float freq_base = 1000000.0f;
     float theta = position / powf(freq_base, (2.0f * (float)pair_idx) / (float)head_dim);
+    if (freq_factors) theta /= freq_factors[pair_idx];
     float cos_theta = cosf(theta);
     float sin_theta = sinf(theta);
+    const int off0 = neox ? pair_idx : 2 * pair_idx;
+    const int off1 = neox ? pair_idx + half_head_dim : 2 * pair_idx + 1;
 
-    // Qwen uses NEOX RoPE (rotate_half): pair (pair_idx, pair_idx + half_head_dim)
-    for (int h = 0; h < num_q_heads; ++h) {
-        int base = h * head_dim;
-        int idx0 = base + pair_idx;
-        int idx1 = base + pair_idx + half_head_dim;
+    for (int h = 0; h < num_q_heads + num_kv_heads; ++h) {
+        half* v = h < num_q_heads ? d_query + h * head_dim : d_key + (h - num_q_heads) * head_dim;
+        float x0 = __half2float(v[off0]);
+        float x1 = __half2float(v[off1]);
 
-        float q0 = __half2float(d_query[idx0]);
-        float q1 = __half2float(d_query[idx1]);
-
-        float res0 = q0 * cos_theta - q1 * sin_theta;
-        float res1 = q0 * sin_theta + q1 * cos_theta;
+        float res0 = x0 * cos_theta - x1 * sin_theta;
+        float res1 = x0 * sin_theta + x1 * cos_theta;
         if (isnan(res0)) res0 = 0.0f; else if (res0 > 65504.0f) res0 = 65504.0f; else if (res0 < -65504.0f) res0 = -65504.0f;
         if (isnan(res1)) res1 = 0.0f; else if (res1 > 65504.0f) res1 = 65504.0f; else if (res1 < -65504.0f) res1 = -65504.0f;
 
-        d_query[idx0] = __float2half(res0);
-        d_query[idx1] = __float2half(res1);
-    }
-
-    for (int h = 0; h < num_kv_heads; ++h) {
-        int base = h * head_dim;
-        int idx0 = base + pair_idx;
-        int idx1 = base + pair_idx + half_head_dim;
-
-        float k0 = __half2float(d_key[idx0]);
-        float k1 = __half2float(d_key[idx1]);
-
-        float res0 = k0 * cos_theta - k1 * sin_theta;
-        float res1 = k0 * sin_theta + k1 * cos_theta;
-        if (isnan(res0)) res0 = 0.0f; else if (res0 > 65504.0f) res0 = 65504.0f; else if (res0 < -65504.0f) res0 = -65504.0f;
-        if (isnan(res1)) res1 = 0.0f; else if (res1 > 65504.0f) res1 = 65504.0f; else if (res1 < -65504.0f) res1 = -65504.0f;
-
-        d_key[idx0] = __float2half(res0);
-        d_key[idx1] = __float2half(res1);
+        v[off0] = __float2half(res0);
+        v[off1] = __float2half(res1);
     }
 }
 

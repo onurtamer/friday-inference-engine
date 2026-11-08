@@ -327,6 +327,7 @@ int main(int argc, char** argv) {
             // Apply Qwen ChatML template before encoding
             std::string templated_prompt = tokenizer.applyChatTemplate(prompt);
             std::vector<int> input_tokens = tokenizer.encode(templated_prompt);
+            if (tokenizer.addsBos()) input_tokens.insert(input_tokens.begin(), tokenizer.getBosTokenId());
             std::cout << "[Tokenizer] Prompt ChatML formatinda islendi (" << input_tokens.size() << " token).\n";
 
             if (input_tokens.empty()) {

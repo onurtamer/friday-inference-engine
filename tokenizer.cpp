@@ -75,12 +75,13 @@ uint32_t asciiLower(uint32_t cp) { return (cp >= 'A' && cp <= 'Z') ? cp + 32 : c
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Qwen2 pre-tokenizer. Implements, at each position, the first matching
-// alternative of:
-//   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
+// Qwen2 / Llama 3 pre-tokenizer. Implements, at each position, the first
+// matching alternative of:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,max_digits}
 //   | ' '?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// The two regexes differ only in the digit group: qwen2 \p{N}, llama-bpe \p{N}{1,3}.
 // ---------------------------------------------------------------------------
-std::vector<std::string> Tokenizer::preTokenize(const std::string& text) {
+std::vector<std::string> Tokenizer::preTokenize(const std::string& text, int max_digits) {
     const std::vector<CodePoint> cps = decodeUtf8(text);
     const size_t n = cps.size();
     std::vector<std::string> out;
@@ -110,8 +111,11 @@ std::vector<std::string> Tokenizer::preTokenize(const std::string& text) {
                 end = j;
             }
         }
-        // 3. single number
-        if (!end && isNumber(c)) end = i + 1;
+        // 3. numbers, up to max_digits per piece
+        if (!end && isNumber(c)) {
+            end = i + 1;
+            while (end < n && (int)(end - i) < max_digits && isNumber(cps[end].cp)) ++end;
+        }
         // 4. optional space + punctuation/symbols + trailing newlines
         if (!end) {
             size_t j = (c == ' ') ? i + 1 : i;
@@ -227,9 +231,18 @@ Tokenizer::Tokenizer(const friday::GgufFile& gguf) {
     if (model != "gpt2")
         throw std::runtime_error("unsupported tokenizer model '" + model + "' (supported: gpt2 byte-level BPE)");
     const std::string pre = gguf.getString("tokenizer.ggml.pre", "");
-    if (pre != "qwen2")
-        std::cerr << "Warning: tokenizer pre-type '" << pre << "' uses the Qwen2 pre-tokenizer, "
-                     "which may split text differently from the reference.\n";
+    if (pre == "llama-bpe") {
+        // llama.cpp defaults for this pre-type: digits in groups of up to 3,
+        // BOS added, and whole pre-tokens found in the vocabulary skip BPE merges.
+        max_digits_ = 3;
+        add_bos_ = true;
+        ignore_merges_ = true;
+    }
+    else if (pre != "qwen2")
+        std::cerr << "Warning: tokenizer pre-type '" << pre << "' is not implemented; using the Qwen2 "
+                     "pre-tokenizer, which may split text differently from the reference.\n";
+    if (gguf.has("tokenizer.ggml.bos_token_id")) bos_token_id_ = (int)gguf.getUInt("tokenizer.ggml.bos_token_id");
+    if (gguf.has("tokenizer.ggml.add_bos_token")) add_bos_ = gguf.metadata().at("tokenizer.ggml.add_bos_token").b;
     const auto& tokens = gguf.getStringArray("tokenizer.ggml.tokens");
     for (int i = 0; i < (int)tokens.size(); ++i) {
         id_to_token_[i] = tokens[i];
@@ -256,6 +269,12 @@ void Tokenizer::encodeBpe(const std::string& piece, std::vector<int>& out) const
     std::vector<std::string> sym;
     sym.reserve(piece.size());
     for (unsigned char b : piece) sym.push_back(byte_encoder_[b]);
+    if (ignore_merges_) {
+        std::string whole;
+        for (const auto& x : sym) whole += x;
+        auto it = token_to_id_.find(whole);
+        if (it != token_to_id_.end()) { out.push_back(it->second); return; }
+    }
 
     while (sym.size() > 1) {
         int best_rank = INT_MAX;
@@ -320,7 +339,7 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
         if (next > i) {
             const std::string segment = text.substr(i, next - i);
             if (merge_ranks_.empty()) encodeGreedyLegacy(segment, tokens);
-            else for (const auto& piece : preTokenize(segment)) encodeBpe(piece, tokens);
+            else for (const auto& piece : preTokenize(segment, max_digits_)) encodeBpe(piece, tokens);
         }
         if (hit) { tokens.push_back(hit->second); i = next + hit->first.size(); }
         else i = next;
@@ -349,7 +368,13 @@ std::string Tokenizer::decode(const std::vector<int>& tokens) const {
 }
 
 std::string Tokenizer::applyChatTemplate(const std::string& prompt) const {
-    // Qwen ChatML format
+    // Llama 3 header format when the vocabulary has its header tokens (full
+    // per-model chat templates are roadmap R6); otherwise Qwen ChatML.
+    if (token_to_id_.count("<|start_header_id|>") && token_to_id_.count("<|eot_id|>")) {
+        return "<|start_header_id|>system<|end_header_id|>\n\nYou are FRIDAY, a helpful AI assistant.<|eot_id|>"
+               "<|start_header_id|>user<|end_header_id|>\n\n" + prompt +
+               "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+    }
     std::string templated;
     templated += "<|im_start|>system\nYou are FRIDAY, a helpful AI assistant.<|im_end|>\n";
     templated += "<|im_start|>user\n";

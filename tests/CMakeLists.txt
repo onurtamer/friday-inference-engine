@@ -103,3 +103,20 @@ if(FRIDAY_MODEL_DIR)
         set_tests_properties(model_regression_qwen25_32b_q2k PROPERTIES LABELS "model" TIMEOUT 600)
     endif()
 endif()
+set(FRIDAY_LLAMA31_GGUF "" CACHE FILEPATH
+    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (bartowski) for the Llama 3.1 model tests")
+if(FRIDAY_LLAMA31_GGUF AND EXISTS ${FRIDAY_LLAMA31_GGUF})
+    # Tokenizer vs. llama.cpp llama-tokenize ids (CPU only).
+    add_test(NAME tokenizer_llama3_reference
+             COMMAND test_tokenizer_qwen ${FRIDAY_LLAMA31_GGUF}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/llama3_encode_reference.json)
+    set_tests_properties(tokenizer_llama3_reference PROPERTIES LABELS "model")
+    # Golden vs. llama.cpp: all layers on the GPU, and a 3 GB VRAM cap that puts
+    # most layers on the CPU path.
+    add_test(NAME model_regression_llama31_8b_q4km
+             COMMAND golden_check ${FRIDAY_LLAMA31_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/llama31-8b-q4km - 12.0)
+    add_test(NAME model_regression_llama31_8b_q4km_cpu
+             COMMAND golden_check ${FRIDAY_LLAMA31_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/llama31-8b-q4km - 3.0)
+    set_tests_properties(model_regression_llama31_8b_q4km model_regression_llama31_8b_q4km_cpu
+                         PROPERTIES LABELS "model" TIMEOUT 600)
+endif()

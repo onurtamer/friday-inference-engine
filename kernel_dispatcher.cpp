@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "kernel_dispatcher.h"
 #include "cuda_math_kernels.h"
 // We avoid directly including .cu files to prevent multiple definition errors during linking.
@@ -16,6 +17,8 @@ namespace friday_hpc {
     extern void launch_q3_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
     extern void launch_q4_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
     extern void launch_q6_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
+    extern void launch_q5_K_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
+    extern void launch_q8_0_hpc(const half* x, const void* W, half* y, int K, int N, cudaStream_t s);
 }
 
 void FridayKernelDispatcher::dispatchGemvKernel(
@@ -36,6 +39,12 @@ void FridayKernelDispatcher::dispatchGemvKernel(
             exit(EXIT_FAILURE);
         }
         case INT8: {
+            // Q8_0: int8-activation dp4a kernel unless FRIDAY_GEMV_FP32=1.
+            const char* fp32 = std::getenv("FRIDAY_GEMV_FP32");
+            if (!(fp32 && fp32[0] == '1')) {
+                friday_hpc::launch_q8_0_hpc(d_activations, d_weights, d_output, K, N, stream);
+                break;
+            }
             launchQ8_0GemvKernel(
                 d_activations,
                 static_cast<const block_q8_0*>(d_weights),
@@ -90,6 +99,10 @@ void FridayKernelDispatcher::dispatchGemvKernel(
         }
         case Q4_K: {
             friday_hpc::launch_q4_K_hpc(d_activations, d_weights, d_output, K, N, stream);
+            break;
+        }
+        case Q5_K: {
+            friday_hpc::launch_q5_K_hpc(d_activations, d_weights, d_output, K, N, stream);
             break;
         }
 

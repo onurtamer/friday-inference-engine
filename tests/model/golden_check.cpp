@@ -39,6 +39,7 @@ static QuantType quantFromString(const std::string& s) {
     if (s == "Q2_K") return Q2_K;
     if (s == "Q3_K") return Q3_K;
     if (s == "Q4_K") return Q4_K;
+    if (s == "Q5_K") return Q5_K;
     return UNKNOWN;
 }
 
@@ -143,6 +144,7 @@ int main(int argc, char** argv) {
             printf("[GOLDEN] prompt tokens from file: %s\n", argv[6]);
         } else {
             tokens = tokenizer.encode(prm.value("chatml", true) ? tokenizer.applyChatTemplate(prompt) : prompt);
+            if (tokenizer.addsBos()) tokens.insert(tokens.begin(), tokenizer.getBosTokenId());
         }
         const size_t prompt_len = tokens.size();
         int nans = 0, total_nans = 0;
@@ -150,7 +152,7 @@ int main(int argc, char** argv) {
         // Reference runtime (optional): <golden_dir>/llama_cpp_reference.json
         nlohmann::json ref;
         std::vector<int> ref_tokens, ref_top1;
-        std::vector<double> ref_top1_lp;
+        std::vector<double> ref_top1_lp, ref_gap;  // gap: reference top-1 minus top-2 log-prob
         {
             std::ifstream rf(golden_dir + "/llama_cpp_reference.json");
             if (rf.is_open()) {
@@ -159,6 +161,9 @@ int main(int argc, char** argv) {
                 for (const auto& st : ref.at("steps")) {
                     ref_top1.push_back(st.at("top")[0][0].get<int>());
                     ref_top1_lp.push_back(st.at("top")[0][1].get<double>());
+                    ref_gap.push_back(st.at("top").size() > 1
+                                          ? st.at("top")[0][1].get<double>() - st.at("top")[1][1].get<double>()
+                                          : 1e9);
                 }
                 g_ref_top1 = &ref_top1;
             }
@@ -194,18 +199,32 @@ int main(int argc, char** argv) {
             if (next < 0) throw std::runtime_error("all logits NaN/Inf at step " + std::to_string(k));
             out.push_back(next);
             if (k + 1 == max_new) break;
-            tokens.push_back(next);
-            step(next, (int)tokens.size() - 1);
+            // Teacher forcing: with a reference, continue from the reference token so
+            // every step is compared in the same context (a near-tie that flips one
+            // token does not derail the rest of the comparison).
+            const int feed = (k < (int)ref_tokens.size()) ? ref_tokens[k] : next;
+            tokens.push_back(feed);
+            step(feed, (int)tokens.size() - 1);
             next = argmaxLogits(d_logits, vocab, s, &nans); total_nans += nans;
         }
         auto t2 = std::chrono::steady_clock::now();
 
-        int mismatches = 0, first_div = -1;
+        // Snapshot: with teacher forcing every step has the reference context, so a
+        // step where the reference itself is a near-tie may flip between builds or
+        // GPU/CPU layer splits; such steps are reported but not counted.
+        int mismatches = 0, first_div = -1, snapshot_near_ties = 0;
         const size_t n = std::max(out.size(), golden_tokens.size());
         for (size_t i = 0; i < n; ++i) {
             const bool same = i < out.size() && i < golden_tokens.size() && out[i] == golden_tokens[i];
-            if (!same) { ++mismatches; if (first_div < 0) first_div = (int)i; }
+            if (same) continue;
+            if (i < out.size() && i < golden_tokens.size() && i < ref_gap.size() && ref_gap[i] < 0.1) {
+                ++snapshot_near_ties;
+                continue;
+            }
+            ++mismatches;
+            if (first_div < 0) first_div = (int)i;
         }
+        if (snapshot_near_ties) printf("[GOLDEN] snapshot differs only at %d reference near-tie step(s)\n", snapshot_near_ties);
         const double pre_s = std::chrono::duration<double>(t1 - t0).count();
         const double dec_s = std::chrono::duration<double>(t2 - t1).count();
 
@@ -226,9 +245,15 @@ int main(int argc, char** argv) {
         bool ref_ok = true;
         if (!ref_tokens.empty()) {
             const double kTop1LogprobTol = 0.3;
-            int ref_mismatch = 0;
-            for (size_t i = 0; i < ref_tokens.size(); ++i)
-                if (i >= out.size() || out[i] != ref_tokens[i]) ++ref_mismatch;
+            // A differing argmax counts as a failure unless the reference itself has a
+            // near-tie there (top-1 and top-2 within kNearTie nats).
+            const double kNearTie = 0.1;
+            int ref_mismatch = 0, near_ties = 0;
+            for (size_t i = 0; i < ref_tokens.size(); ++i) {
+                if (i < out.size() && out[i] == ref_tokens[i]) continue;
+                if (i < out.size() && i < ref_gap.size() && ref_gap[i] < kNearTie) { ++near_ties; continue; }
+                ++ref_mismatch;
+            }
             double max_d = 0; size_t worst = 0;
             for (size_t i = 0; i < g_top1_logprob.size() && i < ref_top1_lp.size(); ++i) {
                 const double d = std::fabs(g_top1_logprob[i] - ref_top1_lp[i]);
@@ -244,9 +269,10 @@ int main(int argc, char** argv) {
                     std::fclose(df);
                 }
             }
-            printf("[REFERENCE] %s: token mismatches %d/%zu | max |top-1 logprob diff| %.4f at step %zu (tol %.2f) | %s\n",
-                   ref.value("runtime", std::string("reference")).c_str(), ref_mismatch, ref_tokens.size(),
-                   max_d, worst, kTop1LogprobTol, ref_ok ? "PASS" : "FAIL");
+            printf("[REFERENCE] %s: token mismatches %d/%zu (+%d at near-ties < %.1f nats) | max |top-1 logprob diff| "
+                   "%.4f at step %zu (tol %.2f) | %s\n",
+                   ref.value("runtime", std::string("reference")).c_str(), ref_mismatch, ref_tokens.size(), near_ties,
+                   kNearTie, max_d, worst, kTop1LogprobTol, ref_ok ? "PASS" : "FAIL");
         }
         const bool pass = mismatches == 0 && ref_ok;
         printf("[GOLDEN] RESULT: %s\n", pass ? "PASS" : "FAIL");

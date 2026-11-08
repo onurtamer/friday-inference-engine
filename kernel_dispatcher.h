@@ -28,6 +28,7 @@ enum QuantType {
     Q2_K = 10,
     Q3_K = 11,
     Q4_K = 12,
+    Q5_K = 13,
     UNKNOWN
 };
 

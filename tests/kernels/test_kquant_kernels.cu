@@ -69,7 +69,8 @@ int main(int argc, char** argv) {
             cudaFree(d_t); cudaFree(d_o);
             tol = 2e-3;   // fp16 rounding of each dequantized value
         } else {
-            const QuantType qt = c == "q2_k" ? Q2_K : c == "q3_k" ? Q3_K : c == "q4_k" ? Q4_K : Q6_K;
+            const QuantType qt = c == "q2_k" ? Q2_K : c == "q3_k" ? Q3_K : c == "q4_k" ? Q4_K
+                               : c == "q5_k" ? Q5_K : c == "q8_0" ? INT8 : Q6_K;
             auto w = readFile<uint8_t>(dir + "/" + c + "_w.bin");
             auto x = readFile<uint16_t>(dir + "/" + c + "_x.bin");
             ref = readFile<double>(dir + "/" + c + "_yref.bin");
@@ -88,7 +89,7 @@ int main(int argc, char** argv) {
             tol = 5e-3;   // fp32 accumulation, fp16 output
             // Q2_K/Q3_K/Q4_K use int8 activations (dp4a) unless FRIDAY_GEMV_FP32=1.
             const char* fp32_env = std::getenv("FRIDAY_GEMV_FP32");
-            const bool int8_act = qt != Q6_K && !(fp32_env && fp32_env[0] == '1');
+            const bool int8_act = !(fp32_env && fp32_env[0] == '1') || qt == Q5_K;  // Q5_K has no fp32 kernel
             if (int8_act) {
                 // Exact semantics: reference that quantizes x the same way.
                 auto ref_q8 = readFile<double>(dir + "/" + c + "_yref_q8.bin");

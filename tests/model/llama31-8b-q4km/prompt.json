@@ -1,0 +1,5 @@
+{
+  "prompt": "C++ dilinde RAII prensibini ve neden onemli oldugunu kisaca acikla.",
+  "chatml": true,
+  "note": "chatml=true applies the engine's chat template; for Llama 3 vocabularies that is the <|start_header_id|> format with BOS"
+}

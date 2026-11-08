@@ -38,7 +38,10 @@ public:
     std::string applyChatTemplate(const std::string& prompt) const;
 
     // Qwen2 pre-tokenizer: splits UTF-8 text into pre-tokens (exposed for tests).
-    static std::vector<std::string> preTokenize(const std::string& text);
+    // max_digits: 1 for qwen2, 3 for llama-bpe.
+    static std::vector<std::string> preTokenize(const std::string& text, int max_digits = 1);
+    int getBosTokenId() const { return bos_token_id_; }
+    bool addsBos() const { return add_bos_ && bos_token_id_ >= 0; }  // GGUF tokenizer.ggml.add_bos_token
 
     void parseConfigFile(const std::string& config_path);
 
@@ -47,6 +50,10 @@ private:
     void encodeBpe(const std::string& piece, std::vector<int>& out) const;
     void encodeGreedyLegacy(const std::string& segment, std::vector<int>& out) const;
 
+    int max_digits_ = 1;
+    int bos_token_id_ = -1;
+    bool add_bos_ = false;
+    bool ignore_merges_ = false;  // llama-bpe: a pre-token that is a whole vocab entry is used as is
     std::map<int, std::string> id_to_token_;
     std::map<std::string, int> token_to_id_;
     std::unordered_map<std::string, int> merge_ranks_;          // "left right" -> rank

@@ -24,6 +24,10 @@ struct ModelConfig {
     float rope_freq_base = 10000.0f;
     std::string file_type;      // dominant quantization ("Q2_K", ...) from general.file_type, if known
 
+    // NEOX (rotate_half) RoPE pairing, as llama.cpp uses for qwen2/qwen3;
+    // false = GGML "normal" pairing (llama, mistral).
+    bool ropeNeox() const { return architecture != "llama"; }
+
     static ModelConfig fromGguf(const GgufFile& f);
     // Throws std::runtime_error if this engine cannot run the model yet
     // (architecture, RoPE settings, head dim), with a message saying why.

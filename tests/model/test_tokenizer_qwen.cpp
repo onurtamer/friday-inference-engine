@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     std::ifstream f(argv[2]);
     if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[2]); return 2; }
     const auto ref = nlohmann::json::parse(f);
-    CHECK(tok.getVocabSize() == ref["vocab_size"].get<int>());
+    if (ref.contains("vocab_size")) CHECK(tok.getVocabSize() == ref["vocab_size"].get<int>());
     int n = 0, exact = 0;
     for (const auto& c : ref["cases"]) {
         const std::string text = c["text"];

@@ -144,7 +144,14 @@ cd friday-inference-engine
 ```
 
 ### Step 2: Download a Model
-Download a GGUF file of a supported model, e.g. `Qwen2.5-32B-Instruct-Q2_K.gguf` (architecture `qwen2`; Llama 3.x and Qwen3 are planned in roadmap R2c). No conversion step is needed.
+Download a GGUF file of a supported model. No conversion step is needed.
+
+| Architecture | Tested model (golden test vs. llama.cpp) | Weight types (GPU and CPU kernels) |
+| :--- | :--- | :--- |
+| `qwen2` (Qwen2.5) | Qwen2.5-32B-Instruct Q2_K | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 |
+| `llama` (Llama 3.x) | Meta-Llama-3.1-8B-Instruct Q4_K_M | (same) |
+
+Requirements today: head dimension 128, BPE (`gpt2`) tokenizer with the `qwen2` or `llama-bpe` pre-tokenizer. Other architectures are rejected with a message. Qwen3 and Mistral are planned.
 
 ### Step 3: Build the Engine
 Build the project in `Release` mode using CMake:
@@ -203,8 +210,10 @@ Measured by the author on one machine: **RTX 3060 12 GB (PCIe 3.0 x16), Ryzen 5 
 
 | Engine | Layers GPU / CPU | Decode tok/s | Prefill tok/s |
 | :--- | :--- | ---: | ---: |
-| **FRIDAY** (this repo) | 57 / 7 | **~10.4** | ~10.2 |
+| **FRIDAY** (this repo) | 57 / 7 | **~10.8** | ~10.2 |
 | llama.cpp b12189 (CUDA 12.4 build) | 50 / 14 | 8.3 | 73.5 |
+
+Meta-Llama-3.1-8B-Instruct Q4_K_M, which fits in VRAM entirely (same machine and method): FRIDAY ~52.8 tok/s decode, llama.cpp 58 tok/s. With the whole model on the GPU FRIDAY is still behind; closing that gap is roadmap R4.
 
 - Prefill in FRIDAY is still token by token (batched prefill with tensor-core GEMM is on the roadmap), so llama.cpp is far ahead there.
 - Outputs are checked against llama.cpp on every change: 32/32 identical greedy tokens, max top-1 log-prob difference 0.27 (`ctest -L model`).

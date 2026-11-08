@@ -46,9 +46,16 @@ recorded, docs updated, commit reviewed.
         size, SHA-256 (self-contained, NIST vectors; cached by size + mtime;
         matches certutil on the 12 GB model), architecture, name, license, quant,
         parameter count. JSON in the user config dir, atomic writes.
-  - [ ] R2c: Llama 3.x (RoPE mode, no qkv bias, llama-bpe pre-tokenizer) and Qwen3
-        (q/k norm); Q5_K/Q6_K/Q8_0 CPU and GPU dp4a kernels; golden vs llama.cpp
-        for Llama-3.1-8B-Instruct Q4_K_M.
+  - [x] R2c (Llama): `llama` architecture — GGML normal-mode RoPE with base and
+        Llama 3 frequency factors from the GGUF, no qkv bias, `llama-bpe`
+        pre-tokenizer (digit groups of 3, BOS, ignore_merges): 20/20 ids vs.
+        llama-tokenize. Q5_K/Q6_K/Q8_0 on the CPU (AVX2) and as dp4a GPU kernels
+        (Q6_K 176-205 -> ~318 GB/s), plus embedding rows. Golden vs. llama.cpp for
+        Meta-Llama-3.1-8B-Instruct Q4_K_M (all-GPU and 9 GPU / 23 CPU layers):
+        32/32, max top-1 diff 0.035. Golden check now uses teacher forcing on
+        the reference tokens and reports reference near-ties (< 0.1 nats).
+        Numerics: Q6_K now uses int8 activations; Qwen2.5 max diff 0.271 -> 0.278.
+  - [ ] R2c (rest): Qwen3 (q/k norm) and Mistral, each with a golden test.
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).

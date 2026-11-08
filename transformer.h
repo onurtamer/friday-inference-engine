@@ -152,6 +152,12 @@ private:
     half* d_v_cache_ = nullptr;
     half* d_attn_ctx_ = nullptr;  // attention output, input of the O projection
 
+    // RoPE settings (GGUF metadata; the deprecated .bin path keeps the Qwen2 defaults).
+    float rope_freq_base_ = 1000000.0f;
+    bool rope_neox_ = true;
+    float* d_rope_freqs_ = nullptr;      // optional per-pair frequency factors (Llama 3)
+    std::vector<float> h_rope_freqs_;
+
     // Layers that do not fit in VRAM. Default: computed on the CPU from host RAM
     // (host memory bandwidth is well above PCIe on typical desktops).
     // FRIDAY_OFFLOAD=stream selects the previous mode: stream the layer weights

@@ -6,8 +6,8 @@
 // scale per block (d = amax / 127, round-half-even), so CPU and GPU layers
 // compute the same math up to fp32 summation order.
 //
-// Weights use the GGML block layouts (Q2_K 84 B, Q3_K 110 B, Q4_K 144 B per 256
-// values) and are read in place (e.g. from the pinned host layer cache).
+// Weights use the GGML block layouts (Q2_K 84 B, Q3_K 110 B, Q4_K 144 B, Q6_K
+// 210 B per 256 values) and are read in place (e.g. from the pinned host layer cache).
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +15,7 @@
 
 namespace friday_cpu {
 
-enum class KQuant { Q2_K, Q3_K, Q4_K };
+enum class KQuant { Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 };
 
 struct Q8Activation {
     int K = 0;
@@ -35,6 +35,7 @@ void roundToHalf(float* x, int n);
 size_t rowBytes(KQuant t, int K);
 
 // y[r] = dot(W row r, x) for r in [r0, r1). K must be a multiple of 256.
+// (Q5_K 176 B per 256, Q8_0 34 B per 32.)
 void gemvRows(KQuant t, const uint8_t* W, const Q8Activation& x, float* y, int r0, int r1);
 
 // Portable scalar reference (used by tests and on CPUs without AVX2).
