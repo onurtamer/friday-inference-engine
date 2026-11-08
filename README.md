@@ -183,7 +183,17 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | `--vram` | `<float>` | Maximum GPU VRAM to allocate for weights and buffers (in GB). | `0.0` (Auto-detect free VRAM) |
 | `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). GPU layers keep it in VRAM (fp16, 4 KiB per token per layer for Qwen2.5-32B), CPU layers in host RAM. | `2048` |
 | `--threads` | `<int>` | CPU threads for the CPU-computed layers. | `0` (2/3 of the logical CPUs) |
-| `<model_path>`| `<string>` | Path to the `.gguf` model file (a converted `.bin` is still accepted, deprecated). | `friday_aligned_int4.bin` |
+| `<model_path>`| `<string>` | Path to the `.gguf` model file, or the id of a registered model (a converted `.bin` is still accepted, deprecated). | `friday_aligned_int4.bin` |
+
+### Model registry
+```bash
+FridayEngine models add Qwen2.5-32B-Instruct-Q2_K.gguf qwen2.5-32b-q2k   # hashes the file once (~40 s for 12 GB)
+FridayEngine models list                                                 # id, architecture, quant, size, parameters, license, SHA-256
+FridayEngine models verify qwen2.5-32b-q2k                               # re-hash and compare
+FridayEngine models remove qwen2.5-32b-q2k                               # forgets the entry, keeps the file
+FridayEngine qwen2.5-32b-q2k                                             # run by id
+```
+The registry is a JSON file: `%APPDATA%\friday\models.json` on Windows, `~/.config/friday/models.json` on Linux (override with `FRIDAY_REGISTRY`). The license is taken from the GGUF `general.license` field when present; check the model card in any case.
 
 ---
 

@@ -40,6 +40,8 @@ set(FRIDAY_ENGINE_SOURCES
 set(FRIDAY_CPU_SOURCES
     gguf_file.cpp
     model_config.cpp
+    model_registry.cpp
+    sha256.cpp
     cpu_kquants.cpp
     cpu_ops.cpp
     cpu_threadpool.cpp

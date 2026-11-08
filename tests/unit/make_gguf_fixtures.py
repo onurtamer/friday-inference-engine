@@ -61,4 +61,25 @@ write("bad_version.gguf", data[:4] + struct.pack("<I", 99) + data[8:])
 write("bad_kv_count.gguf", data[:16] + struct.pack("<Q", 1 << 40) + data[24:])
 for i, cut in enumerate([3, 20, 60, 200, exp["data_offset"] - 8, len(data) - 100]):
     write("bad_trunc_%d.gguf" % i, data[:cut])
+
+# A loadable-looking model header for the registry test (2 layers, licensed).
+mpath = os.path.join(out, "model.gguf")
+m = GGUFWriter(mpath, "qwen2")
+m.add_string("general.name", "Tiny Model")
+m.add_string("general.license", "apache-2.0")
+m.add_uint32("general.file_type", 10)  # Q2_K
+m.add_uint32("qwen2.block_count", 2)
+m.add_uint32("qwen2.embedding_length", 256)
+m.add_uint32("qwen2.attention.head_count", 2)
+m.add_uint32("qwen2.attention.head_count_kv", 1)
+m.add_uint32("qwen2.context_length", 4096)
+m.add_float32("qwen2.attention.layer_norm_rms_epsilon", 1e-6)
+m.add_tensor("blk.0.attn_norm.weight", np.ones(256, dtype=np.float32))
+m.add_tensor("blk.1.attn_norm.weight", np.ones(256, dtype=np.float32))
+m.add_tensor("blk.0.ffn_up.weight", rng.integers(0, 256, size=(3, 84), dtype=np.uint8), raw_dtype=T.Q2_K)
+m.write_header_to_file(); m.write_kv_data_to_file(); m.write_tensors_to_file(); m.close()
+import hashlib
+with open(os.path.join(out, "model_expected.json"), "w") as f:
+    json.dump({"sha256": hashlib.sha256(open(mpath, "rb").read()).hexdigest(),
+               "parameters": 256 + 256 + 3 * 256, "size": os.path.getsize(mpath)}, f)
 print("gguf fixtures written to", out)

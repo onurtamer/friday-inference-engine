@@ -16,6 +16,8 @@
 #include "transformer.h"
 #include "gguf_file.h"
 #include "model_config.h"
+#include "model_registry.h"
+#include <cstdio>
 #include <memory>
 #include "io_manager.h"
 #include "tokenizer.h"
@@ -119,11 +121,52 @@ int argmaxFromDeviceLogits(const half* d_logits, int vocab_size, cudaStream_t st
     return max_idx;
 }
 
+// `FridayEngine models <list|add|remove|verify> ...`: manage the local model registry.
+static int runModelsCommand(int argc, char** argv) {
+    friday::ModelRegistry reg;
+    const std::string cmd = argc >= 3 ? argv[2] : "list";
+    if (cmd == "list") {
+        std::cout << "Registry: " << reg.file() << "\n";
+        if (reg.entries().empty()) { std::cout << "  (no models; add one with: models add <file.gguf> [id])\n"; return 0; }
+        for (const auto& e : reg.entries()) {
+            char line[512];
+            std::snprintf(line, sizeof(line), "  %-28s %-8s %-7s %6.2f GB  %5.1fB params  %-12s %s\n", e.id.c_str(),
+                          e.architecture.c_str(), e.quant.c_str(), e.size / 1e9, e.parameters / 1e9,
+                          e.license.empty() ? "(no license)" : e.license.c_str(), e.path.c_str());
+            std::cout << line << "      sha256 " << e.sha256 << "\n";
+        }
+        return 0;
+    }
+    if (cmd == "add" && argc >= 4) {
+        const auto& e = reg.add(argv[3], argc >= 5 ? argv[4] : "");
+        std::cout << "Added '" << e.id << "' (" << e.architecture << ", " << e.quant << ", sha256 " << e.sha256 << ")\n";
+        if (e.license.empty()) std::cout << "  Note: the file has no general.license; check the model card.\n";
+        return 0;
+    }
+    if (cmd == "remove" && argc >= 4) {
+        if (!reg.remove(argv[3])) { std::cerr << "unknown model id: " << argv[3] << "\n"; return 1; }
+        std::cout << "Removed '" << argv[3] << "' (the file itself was not touched)\n";
+        return 0;
+    }
+    if (cmd == "verify" && argc >= 4) {
+        std::string actual;
+        const bool ok = reg.verify(argv[3], &actual);
+        std::cout << (ok ? "OK: hash matches\n" : "MISMATCH: file changed (sha256 " + actual + ")\n");
+        return ok ? 0 : 1;
+    }
+    std::cerr << "usage: FridayEngine models [list | add <file.gguf> [id] | remove <id> | verify <id>]\n";
+    return 2;
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+    if (argc >= 2 && std::string(argv[1]) == "models") {
+        try { return runModelsCommand(argc, argv); }
+        catch (const std::exception& e) { std::cerr << "Error: " << e.what() << "\n"; return 1; }
+    }
     try {
         std::cout << "===================================================\n";
         std::cout << "  FRIDAY Engine 2.0 - V32 (Elastic Tiered Memory)\n";
@@ -155,6 +198,15 @@ int main(int argc, char** argv) {
                     }
                 } catch (...) {}
                 gguf_model_path = arg;
+            }
+        }
+
+        // A registered model id can be used instead of a path.
+        if (!std::ifstream(gguf_model_path, std::ios::binary).is_open()) {
+            friday::ModelRegistry reg;
+            if (const friday::ModelEntry* e = reg.find(gguf_model_path)) {
+                std::cout << "[Init] Registry: '" << e->id << "' -> " << e->path << "\n";
+                gguf_model_path = e->path;
             }
         }
 

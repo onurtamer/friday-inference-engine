@@ -42,8 +42,10 @@ recorded, docs updated, commit reviewed.
         metadata, per-tensor packed layer buffers (GGUF layers are not always
         contiguous). Qwen2.5-32B from the `.gguf`: golden PASS and per-step
         log-probs bit-identical to the converted `.bin`. converter.py deprecated.
-  - [ ] R2b: model registry (path, SHA-256, license, architecture, quant) in a
-        JSON file in the user config dir; `models list/add`.
+  - [x] R2b: model registry (`models list/add/remove/verify`, run by id): path,
+        size, SHA-256 (self-contained, NIST vectors; cached by size + mtime;
+        matches certutil on the 12 GB model), architecture, name, license, quant,
+        parameter count. JSON in the user config dir, atomic writes.
   - [ ] R2c: Llama 3.x (RoPE mode, no qkv bias, llama-bpe pre-tokenizer) and Qwen3
         (q/k norm); Q5_K/Q6_K/Q8_0 CPU and GPU dp4a kernels; golden vs llama.cpp
         for Llama-3.1-8B-Instruct Q4_K_M.
