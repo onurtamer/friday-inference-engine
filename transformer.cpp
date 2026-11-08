@@ -1,5 +1,6 @@
 #include "transformer.h"
 #include "attention_kernels.h"
+#include "hpc_k_quants.h"
 #include "cpu_kquants.h"
 #include "gguf_file.h"
 #include "model_config.h"
@@ -20,6 +21,11 @@
 // --- CUDA Kernel Declarations ---
 __global__ void rmsNormKernel(half* d_input, const float* d_weight, half* d_output, int size, float epsilon);
 __global__ void headRmsNormKernel(half* d_x, const float* d_weight, int head_dim, float epsilon);
+__global__ void ropeStoreKvKernel(half* d_query, half* d_key, const half* d_value, half* k_layer, half* v_layer,
+                                  const int* d_pos, int head_dim, int num_q_heads, int num_kv_heads, float freq_base,
+                                  int neox, const float* freq_factors);
+__global__ void storeKvQ8Kernel(const half* k, const half* v, int8_t* k_layer, half* ks_layer, int8_t* v_layer,
+                                half* vs_layer, const int* d_pos, int kv_dim);
 __global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len, int pos_offset, int num_q_heads,
                            int num_kv_heads, float freq_base, int neox, const float* freq_factors);
 __global__ void geluKernel(half* d_activations, int size);
@@ -215,7 +221,8 @@ Transformer::Transformer(
     AsyncIOManager* async_io_manager_ptr,
     double vram_limit_gb,
     int max_context,
-    int cpu_threads
+    int cpu_threads,
+    bool kv_q8
 )
     : model_file_path_(model_file_path),
       hidden_dim_(model_hidden_dim),
@@ -227,7 +234,8 @@ Transformer::Transformer(
       model_quant_type_(model_quant_type),
       async_io_manager_ptr_(async_io_manager_ptr),
       vram_limit_gb_(vram_limit_gb),
-      max_ctx_(max_context)
+      max_ctx_(max_context),
+      kv_q8_(kv_q8)
 {
     if (max_ctx_ <= 0) throw std::runtime_error("max_context must be positive");
     if (hidden_dim_ % num_heads_ != 0) {
@@ -363,7 +371,17 @@ Transformer::Transformer(
     // GPU KV cache per layer (K + V, fp16). In CPU-offload mode only GPU layers
     // need it, so it is charged per resident layer; in stream mode every layer
     // is computed on the GPU and the whole cache is reserved up front.
-    const size_t kv_layer_bytes = 2ULL * max_ctx_ * num_kv_heads_ * head_dim_ * sizeof(half);
+    // int8 KV (fused path only): 1 byte per value + one fp16 scale per 32 values.
+    {
+        const char* f = std::getenv("FRIDAY_FUSED");
+        const char* fp32 = std::getenv("FRIDAY_GEMV_FP32");
+        if (kv_q8_ && ((f && f[0] == '0') || (fp32 && fp32[0] == '1'))) {
+            printf("[Transformer] int8 KV needs the fused GPU path; using fp16 KV\n");
+            kv_q8_ = false;
+        }
+    }
+    const size_t kv_elem = (size_t)max_ctx_ * num_kv_heads_ * head_dim_;
+    const size_t kv_layer_bytes = kv_q8_ ? 2ULL * (kv_elem + kv_elem / 32 * sizeof(half)) : 2ULL * kv_elem * sizeof(half);
     const size_t dma_reservation = cpu_offload_ ? 0 : (size_t)kDmaSlotCount * layer_buffer_size_;
     const size_t kv_reservation = cpu_offload_ ? 0 : (size_t)num_layers_ * kv_layer_bytes;
     const size_t required_overhead = kMinGpuReserveBytes + dma_reservation + kv_reservation;
@@ -409,10 +427,42 @@ Transformer::Transformer(
     {
         const int kv_layers = cpu_offload_ ? num_gpu_resident_layers_ : num_layers_;
         const size_t kv_elems = (size_t)(kv_layers > 0 ? kv_layers : 1) * max_ctx_ * num_kv_heads_ * head_dim_;
-        CUDA_CHECK(cudaMalloc((void**)&d_k_cache_, kv_elems * sizeof(half)));
-        CUDA_CHECK(cudaMalloc((void**)&d_v_cache_, kv_elems * sizeof(half)));
-        printf("[Transformer] GPU KV cache: %d layers, max context %d, %.0f MiB (K + V)\n", kv_layers, max_ctx_,
-               (double)(2 * kv_elems * sizeof(half)) / (1024.0 * 1024.0));
+        if (kv_q8_) {
+            CUDA_CHECK(cudaMalloc((void**)&d_k_cache_, kv_elems));
+            CUDA_CHECK(cudaMalloc((void**)&d_v_cache_, kv_elems));
+            CUDA_CHECK(cudaMalloc((void**)&d_k_scale_, kv_elems / 32 * sizeof(half)));
+            CUDA_CHECK(cudaMalloc((void**)&d_v_scale_, kv_elems / 32 * sizeof(half)));
+        } else {
+            CUDA_CHECK(cudaMalloc((void**)&d_k_cache_, kv_elems * sizeof(half)));
+            CUDA_CHECK(cudaMalloc((void**)&d_v_cache_, kv_elems * sizeof(half)));
+        }
+        printf("[Transformer] GPU KV cache: %d layers, max context %d, %s, %.0f MiB (K + V)\n", kv_layers, max_ctx_,
+               kv_q8_ ? "int8" : "fp16", (double)(kv_layers > 0 ? kv_layers : 1) * kv_layer_bytes / (1024.0 * 1024.0));
+    }
+
+    // Fused path: every GEMV weight of every layer needs an int8-activation kernel.
+    {
+        const char* f = std::getenv("FRIDAY_FUSED");
+        const char* fp32 = std::getenv("FRIDAY_GEMV_FP32");
+        fused_ok_ = !(f && f[0] == '0') && !(fp32 && fp32[0] == '1');
+        for (const auto& [name, t] : full_tensor_map_) {
+            if (name.rfind("blk.", 0) != 0 || name.find(".weight") == std::string::npos || t.shape.size() < 2) continue;
+            if (friday_hpc::q8KindFromDtype(t.dtype) == friday_hpc::Q8Kind::None) { fused_ok_ = false; break; }
+        }
+        if (fused_ok_) friday_hpc::ensureQ8Scratch(std::max(hidden_dim_, max_intermediate_size_), nullptr);
+        CUDA_CHECK(cudaMalloc((void**)&d_pos_, sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_attn_ws_, friday_attn::splitAttentionWorkspaceBytes(num_heads_, max_ctx_)));
+        CUDA_CHECK(cudaMallocHost((void**)&h_pos_, sizeof(int)));
+        // CUDA Graph of the GPU-resident layers: fused path, layers not streamed over PCIe,
+        // attention shared memory sized for max_ctx. FRIDAY_GRAPH=0 disables it.
+        const char* g = std::getenv("FRIDAY_GRAPH");
+        // Split-K attention (default); FRIDAY_ATTN_SPLIT=0 selects the one-block-per-head
+        // kernel, which needs the context to fit in shared memory.
+        const char* sp = std::getenv("FRIDAY_ATTN_SPLIT");
+        attn_split_ = !(sp && sp[0] == '0') || !friday_attn::decodeAttentionFitsSharedMemory(max_ctx_);
+        graph_ok_ = fused_ok_ && !(g && g[0] == '0');
+        printf("[Transformer] GPU layer path: %s%s\n", fused_ok_ ? "fused (int8 activations)" : "unfused",
+               graph_ok_ ? " + CUDA Graph" : "");
     }
 
     // Streams are created before any event is recorded on them.
@@ -525,6 +575,12 @@ Transformer::~Transformer() {
     if (d_v_cache_) CUDA_CHECK(cudaFree(d_v_cache_));
     if (d_attn_ctx_) CUDA_CHECK(cudaFree(d_attn_ctx_));
     if (d_rope_freqs_) CUDA_CHECK(cudaFree(d_rope_freqs_));
+    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+    if (d_pos_) CUDA_CHECK(cudaFree(d_pos_));
+    if (d_attn_ws_) CUDA_CHECK(cudaFree(d_attn_ws_));
+    if (d_k_scale_) CUDA_CHECK(cudaFree(d_k_scale_));
+    if (d_v_scale_) CUDA_CHECK(cudaFree(d_v_scale_));
+    if (h_pos_) CUDA_CHECK(cudaFreeHost(h_pos_));
     if (h_act_pinned_) CUDA_CHECK(cudaFreeHost(h_act_pinned_));
     
     if (stream_compute_) CUDA_CHECK(cudaStreamDestroy(stream_compute_));
@@ -867,6 +923,89 @@ bool Transformer::getEmbedding(int token_id, half* d_output, int vocab_size, cud
     return true;
 }
 
+// One transformer layer on the GPU with the int8-activation pipeline. Same math
+// as the unfused sequence (RMSNorm, Q/K/V + bias, [q/k norm], RoPE, KV write,
+// attention, O + residual, RMSNorm, gate/up, SwiGLU, down + residual); only the
+// kernel boundaries differ.
+void Transformer::gpuLayerFused(int layer_idx, unsigned char* buf, half* d_x, int pos, cudaStream_t s) {
+    using friday_hpc::Q8Kind;
+    const auto& li = layers_info_[layer_idx];
+    const std::string pre = "blk." + std::to_string(layer_idx) + ".";
+    auto ptr = [&](const char* n) -> unsigned char* {
+        auto it = li.tensor_rel_offsets.find(pre + n);
+        return it == li.tensor_rel_offsets.end() ? nullptr : buf + it->second;
+    };
+    auto info = [&](const char* n) -> const TensorInfo& { return full_tensor_map_.at(pre + n); };
+    auto kind = [&](const char* n) { return friday_hpc::q8KindFromDtype(info(n).dtype); };
+    if (pos < 0 || pos >= max_ctx_)
+        throw std::runtime_error("context length exceeded: position " + std::to_string(pos) + " >= max context " +
+                                 std::to_string(max_ctx_));
+    const int H = hidden_dim_, kv_dim = num_kv_heads_ * head_dim_;
+
+    // Attention block
+    friday_hpc::rmsNormQuantQ8(d_x, (const float*)ptr("attn_norm.weight"), H, rms_norm_epsilon_, s);
+    friday_hpc::gemvQ8(kind("attn_q.weight"), ptr("attn_q.weight"), d_query_out_, H, (int)info("attn_q.weight").shape[1],
+                       s, nullptr, nullptr, (const float*)ptr("attn_q.bias"));
+    friday_hpc::gemvQ8(kind("attn_k.weight"), ptr("attn_k.weight"), d_key_out_, H, (int)info("attn_k.weight").shape[1],
+                       s, nullptr, nullptr, (const float*)ptr("attn_k.bias"));
+    friday_hpc::gemvQ8(kind("attn_v.weight"), ptr("attn_v.weight"), d_value_out_, H, (int)info("attn_v.weight").shape[1],
+                       s, nullptr, nullptr, (const float*)ptr("attn_v.bias"));
+    if (ptr("attn_q_norm.weight") && ptr("attn_k_norm.weight")) {
+        headRmsNormKernel<<<num_heads_, head_dim_, head_dim_ * sizeof(float), s>>>(
+            d_query_out_, (const float*)ptr("attn_q_norm.weight"), head_dim_, rms_norm_epsilon_);
+        headRmsNormKernel<<<num_kv_heads_, head_dim_, head_dim_ * sizeof(float), s>>>(
+            d_key_out_, (const float*)ptr("attn_k_norm.weight"), head_dim_, rms_norm_epsilon_);
+    }
+    // Position-dependent kernels read the position from d_pos_ (set by forward()),
+    // so this sequence can be captured once in a CUDA Graph and replayed.
+    (void)pos;
+    const size_t layer_elems = (size_t)layer_idx * max_ctx_ * kv_dim;
+    if (kv_q8_) {
+        int8_t* kq = reinterpret_cast<int8_t*>(d_k_cache_) + layer_elems;
+        int8_t* vq = reinterpret_cast<int8_t*>(d_v_cache_) + layer_elems;
+        half* ks = d_k_scale_ + layer_elems / 32;
+        half* vs = d_v_scale_ + layer_elems / 32;
+        ropeStoreKvKernel<<<(head_dim_ / 2 + 255) / 256, 256, 0, s>>>(
+            d_query_out_, d_key_out_, d_value_out_, nullptr, nullptr, d_pos_, head_dim_, num_heads_, num_kv_heads_,
+            rope_freq_base_, rope_neox_ ? 1 : 0, d_rope_freqs_);
+        const int warps = 8, nblk = 2 * kv_dim / 32;
+        storeKvQ8Kernel<<<(nblk + warps - 1) / warps, warps * 32, 0, s>>>(d_key_out_, d_value_out_, kq, ks, vq, vs,
+                                                                          d_pos_, kv_dim);
+        friday_attn::launchDecodeAttentionSplit(d_query_out_, kq, vq, d_attn_ctx_, 0, d_pos_, max_ctx_, num_heads_,
+                                                num_kv_heads_, head_dim_, d_attn_ws_, s, ks, vs);
+    } else {
+    half* k_layer = d_k_cache_ + layer_elems;
+    half* v_layer = d_v_cache_ + layer_elems;
+    ropeStoreKvKernel<<<(head_dim_ / 2 + 255) / 256, 256, 0, s>>>(
+        d_query_out_, d_key_out_, d_value_out_, k_layer, v_layer, d_pos_, head_dim_, num_heads_, num_kv_heads_,
+        rope_freq_base_, rope_neox_ ? 1 : 0, d_rope_freqs_);
+    if (attn_split_) {
+        friday_attn::launchDecodeAttentionSplit(d_query_out_, k_layer, v_layer, d_attn_ctx_, 0, d_pos_, max_ctx_,
+                                                num_heads_, num_kv_heads_, head_dim_, d_attn_ws_, s);
+    } else {
+        friday_attn::launchDecodeAttentionDevPos(d_query_out_, k_layer, v_layer, d_attn_ctx_, d_pos_, max_ctx_, num_heads_,
+                                                 num_kv_heads_, head_dim_, s);
+    }
+    }
+    friday_hpc::quantizeQ8(d_attn_ctx_, num_heads_ * head_dim_, s);
+    friday_hpc::gemvQ8(kind("attn_output.weight"), ptr("attn_output.weight"), d_x, num_heads_ * head_dim_, H, s,
+                       nullptr, nullptr, nullptr, d_x);
+
+    // MLP block (SwiGLU)
+    friday_hpc::rmsNormQuantQ8(d_x, (const float*)ptr("ffn_norm.weight"), H, rms_norm_epsilon_, s);
+    const int I = (int)info("ffn_gate.weight").shape[1];
+    if (kind("ffn_gate.weight") == kind("ffn_up.weight") && info("ffn_up.weight").shape[1] == I) {
+        friday_hpc::gemvQ8(kind("ffn_gate.weight"), ptr("ffn_gate.weight"), d_gate_out_, H, I, s, ptr("ffn_up.weight"),
+                           d_up_out_);
+    } else {
+        friday_hpc::gemvQ8(kind("ffn_gate.weight"), ptr("ffn_gate.weight"), d_gate_out_, H, I, s);
+        friday_hpc::gemvQ8(kind("ffn_up.weight"), ptr("ffn_up.weight"), d_up_out_, H, I, s);
+    }
+    friday_hpc::siluMulQuantQ8(d_gate_out_, d_up_out_, I, s);
+    friday_hpc::gemvQ8(kind("ffn_down.weight"), ptr("ffn_down.weight"), d_x, I, H, s, nullptr, nullptr, nullptr, d_x);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Ana Forward Pass: V27 Ping-Pong Double Buffering mimarisi
 void Transformer::forward(
     half* d_input_activations,
@@ -898,10 +1037,44 @@ void Transformer::forward(
     // V32: Esnek Hibrit Bellek (Elastic Tiered Memory) Forward Pass
     // =========================================================================
 
+    // Position for the device-side kernels (fused path), then the resident layers:
+    // replayed from a CUDA Graph when possible (captured on the first call).
+    if (fused_ok_) {
+        if (pos_offset < 0 || pos_offset >= max_ctx_)
+            throw std::runtime_error("context length exceeded: position " + std::to_string(pos_offset) +
+                                     " >= max context " + std::to_string(max_ctx_));
+        *h_pos_ = pos_offset;
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_, h_pos_, sizeof(int), cudaMemcpyHostToDevice, compute_stream));
+    }
+    bool resident_done = false;
+    if (graph_ok_ && seq_len == 1 && layer_offset == 0 && num_gpu_resident_layers_ > 0) {
+        if (graph_exec_ && (graph_stream_ != compute_stream || graph_input_ != d_input_activations)) {
+            cudaGraphExecDestroy(graph_exec_);
+            graph_exec_ = nullptr;
+        }
+        if (!graph_exec_) {
+            cudaGraph_t graph = nullptr;
+            CUDA_CHECK(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeThreadLocal));
+            for (int l = 0; l < num_gpu_resident_layers_; ++l)
+                gpuLayerFused(l, d_gpu_resident_layers_[l], d_input_activations, pos_offset, compute_stream);
+            CUDA_CHECK(cudaStreamEndCapture(compute_stream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            graph_stream_ = compute_stream;
+            graph_input_ = d_input_activations;
+        }
+        CUDA_CHECK(cudaGraphLaunch(graph_exec_, compute_stream));
+        resident_done = true;
+    }
+
     // 1. GPU VRAM'de yerlesik (resident) katmanlar (0 .. num_gpu_resident_layers_ - 1)
-    for (int layer_idx = 0; layer_idx < num_gpu_resident_layers_; ++layer_idx) {
+    for (int layer_idx = 0; !resident_done && layer_idx < num_gpu_resident_layers_; ++layer_idx) {
         unsigned char* d_curr_buf = d_gpu_resident_layers_[layer_idx];
         const auto& curr_l_info = layers_info_[layer_idx];
+        if (fused_ok_) {
+            gpuLayerFused(layer_idx + layer_offset, d_curr_buf, d_input_activations, pos_offset, compute_stream);
+            continue;
+        }
 
         // 1. Pre-attn RMSNorm
         std::string attn_norm_name = "blk." + std::to_string(layer_idx + layer_offset) + ".attn_norm.weight";
@@ -1016,6 +1189,11 @@ void Transformer::forward(
             CUDA_CHECK(cudaStreamWaitEvent(compute_stream, ev_slot_ready_[curr_slot], 0));
             unsigned char* d_curr_buf = d_layer_buffer_[curr_slot];
             const auto& curr_l_info = layers_info_[layer_idx];
+            if (fused_ok_) {
+                gpuLayerFused(layer_idx + layer_offset, d_curr_buf, d_input_activations, pos_offset, compute_stream);
+                CUDA_CHECK(cudaEventRecord(ev_slot_free_[curr_slot], compute_stream));
+                continue;
+            }
 
             // 1. RMSNorm
             std::string attn_norm_name = "blk." + std::to_string(layer_idx + layer_offset) + ".attn_norm.weight";

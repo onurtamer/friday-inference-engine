@@ -50,7 +50,8 @@ public:
         AsyncIOManager* async_io_manager_ptr,
         double vram_limit_gb = 0.0,
         int max_context = 2048,
-        int cpu_threads = 0
+        int cpu_threads = 0,
+        bool kv_q8 = false      // int8 KV cache on the GPU (fused path only)
     );
 
     ~Transformer();
@@ -145,6 +146,21 @@ private:
     // FRIDAY_OFFLOAD=stream selects the previous mode: stream the layer weights
     // over PCIe into DMA slots every token and compute on the GPU.
     bool cpu_offload_ = true;
+    // Fused GPU layer path (int8-activation pipeline, ~12 launches per layer):
+    // used when every layer weight has a dp4a kernel; FRIDAY_FUSED=0 disables it.
+    bool fused_ok_ = false;
+    int* d_pos_ = nullptr;               // current position, read by the fused kernels
+    void* d_attn_ws_ = nullptr;          // split-K attention partials (fused path)
+    bool attn_split_ = true;
+    bool kv_q8_ = false;                 // GPU KV as int8 + fp16 scale per 32 values
+    half* d_k_scale_ = nullptr;
+    half* d_v_scale_ = nullptr;
+    int* h_pos_ = nullptr;               // pinned staging for d_pos_
+    bool graph_ok_ = false;
+    cudaGraphExec_t graph_exec_ = nullptr;  // resident layers, captured on the first token
+    cudaStream_t graph_stream_ = nullptr;
+    const half* graph_input_ = nullptr;
+    void gpuLayerFused(int layer_idx, unsigned char* d_layer_buf, half* d_x, int pos, cudaStream_t stream);
     std::unique_ptr<friday::CpuLayerRunner> cpu_runner_;  // layers num_gpu_resident_layers_ .. num_layers_ - 1
     half* h_act_pinned_ = nullptr;                         // hidden state staging for GPU <-> CPU hand-off
 

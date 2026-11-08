@@ -22,6 +22,7 @@ struct EngineOptions {
     int max_ctx = 2048;          // KV cache capacity (tokens)
     int cpu_threads = 0;         // 0: default (2/3 of the logical CPUs)
     BackendKind backend = BackendKind::Auto;  // FRIDAY_BACKEND=cpu|cuda overrides Auto
+    bool kv_q8 = false;          // int8 GPU KV cache (--kv q8, or FRIDAY_KV=q8)
 
     // Deprecated .bin path only: hyper-parameters and tensor map from the converter.
     std::string tensor_map;

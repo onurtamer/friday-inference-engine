@@ -178,6 +178,7 @@ int main(int argc, char** argv) {
         int max_context = 2048;      // --ctx N: KV cache capacity in tokens (GPU memory)
         int cpu_threads = 0;         // --threads N: CPU threads for CPU-computed layers (0 = auto)
         friday::BackendKind backend = friday::BackendKind::Auto;  // --backend auto|cuda|cpu
+        bool kv_q8 = false;                                        // --kv f16|q8
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -187,6 +188,11 @@ int main(int argc, char** argv) {
                 max_context = std::stoi(argv[++i]);
             } else if (arg == "--threads" && i + 1 < argc) {
                 cpu_threads = std::stoi(argv[++i]);
+            } else if (arg == "--kv" && i + 1 < argc) {
+                const std::string k = argv[++i];
+                if (k == "q8") kv_q8 = true;
+                else if (k == "f16") kv_q8 = false;
+                else { std::cerr << "unknown --kv '" << k << "' (f16, q8)\n"; return 2; }
             } else if (arg == "--backend" && i + 1 < argc) {
                 const std::string b = argv[++i];
                 if (b == "cpu") backend = friday::BackendKind::Cpu;
@@ -277,6 +283,7 @@ int main(int argc, char** argv) {
         eo.max_ctx = max_context;
         eo.cpu_threads = cpu_threads;
         eo.backend = backend;
+        eo.kv_q8 = kv_q8;
         eo.tensor_map = "tensor_map.json";  // deprecated .bin path only
         eo.hidden_dim = hidden_dim;
         eo.num_heads = num_heads;

@@ -94,6 +94,18 @@ recorded, docs updated, commit reviewed.
   - Step 3c: embedding table in host RAM (one row uploaded per token, numerics
     identical), 8 CPU threads → **10.55 tok/s decode, 10.2 tok/s prefill** (median
     of 3, 57 GPU / 7 CPU). Golden 32/32, max top-1 diff 0.27. llama.cpp: 8.3 / 73.5.
+  - Step 4 (2026-11-09), same-session medians on the RTX 3060:
+    4a fused GPU layer (int8-activation pipeline: RMSNorm+quantize, SiLU*up+
+    quantize, gate+up in one launch, bias/residual in the GEMV epilogue, RoPE+KV
+    write; ~27 -> ~12 launches per layer), bit-identical; 4b CUDA Graph of the
+    resident layers (position read on the device), bit-identical; together
+    Llama 3.1 8B 47.1 -> 51.9 tok/s, Qwen3 8B 45.6 -> 50.0. 4c split-K decode
+    attention: +13% decode at ~1500 context, neutral at short context;
+    numerics change slightly (golden still passes, Qwen2.5 max diff 0.278 ->
+    0.264). 4d optional int8 KV (`--kv q8`): Qwen2.5-32B 58/64 layers on the GPU,
+    12.04 -> 12.73 tok/s; Llama max diff 0.035 -> 0.073 (default stays f16).
+    Versus llama.cpp in the same session (engine decode time): Llama 3.1 8B
+    59.6 vs 61.0 tok/s, Qwen3 8B 58.1 vs 58.9.
   - Evaluated next (2026-11-08, measured with microbenchmarks):
     CUDA Graph of the GPU phase −4.5 ms/token (45.3 → 40.8 ms; GEMV-only floor
     39 ms); split-K decode attention: +7 ms at 1024 context today, mostly

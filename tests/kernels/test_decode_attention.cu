@@ -56,7 +56,11 @@ int main() {
     CUDA_OK(cudaMemcpy(dk, k.data(), k.size() * 2, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(dv, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
 
-    for (int seq : {1, 2, 17, 300, 1000, max_ctx}) {
+    void* ws = nullptr;
+    int* dpos = nullptr;
+    CUDA_OK(cudaMalloc(&ws, friday_attn::splitAttentionWorkspaceBytes(nh, max_ctx)));
+    CUDA_OK(cudaMalloc(&dpos, sizeof(int)));
+    for (int seq : {1, 2, 17, 255, 256, 257, 300, 1000, max_ctx}) {
         std::vector<float> ref(nh * hd);
         cpuAttention(q, k, v, ref, seq, nh, nkv, hd);
         friday_attn::launchDecodeAttention(dq, dk, dv, dout, seq, nh, nkv, hd, 0);
@@ -71,7 +75,23 @@ int main() {
         const double rel = std::sqrt(num / (den > 0 ? den : 1e-300));
         std::printf("seq=%-5d rel_l2=%.3e max_abs=%.3e %s\n", seq, rel, mx, rel < 1e-3 ? "PASS" : "FAIL");
         CHECK(rel < 1e-3);
+        // split-K, sequence length from the host and from device memory
+        for (int mode = 0; mode < 2; ++mode) {
+            const int pos = seq - 1;
+            CUDA_OK(cudaMemcpy(dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+            friday_attn::launchDecodeAttentionSplit(dq, dk, dv, dout, seq, mode ? dpos : nullptr, max_ctx, nh, nkv, hd, ws, 0);
+            CUDA_OK(cudaDeviceSynchronize());
+            CUDA_OK(cudaMemcpy(got.data(), dout, got.size() * 2, cudaMemcpyDeviceToHost));
+            double n2 = 0, d2 = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                const double g = __half2float(got[i]), r = ref[i];
+                n2 += (g - r) * (g - r); d2 += r * r;
+            }
+            const double r2 = std::sqrt(n2 / (d2 > 0 ? d2 : 1e-300));
+            std::printf("  split-K (%s) rel_l2=%.3e %s\n", mode ? "device pos" : "host len", r2, r2 < 1e-3 ? "PASS" : "FAIL");
+            CHECK(r2 < 1e-3);
+        }
     }
-    cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
+    cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(ws); cudaFree(dpos);
     return CHECK_RESULT();
 }

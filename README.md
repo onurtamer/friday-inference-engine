@@ -28,7 +28,7 @@
 
 Modern cloud and edge LLM deployments are heavily constrained by high memory demands and runtime overhead. Running a **14-Billion parameter** model (like `Qwen2.5-14B-Instruct`) typically requires 10 GB – 16 GB of dedicated GPU VRAM. 
 
-FRIDAY Engine splits a model between the GPU and the CPU (**Elastic Tiered Memory**): as many transformer layers as fit are kept in VRAM and computed with custom CUDA kernels; the remaining layers stay in host RAM and are computed on the CPU with SIMD kernels, so no weights cross PCIe during generation. On an RTX 3060 12 GB + Ryzen 5 5600X, Qwen2.5-32B-Instruct Q2_K decodes at ~10.4 tok/s (llama.cpp b12189 on the same machine: 8.3 tok/s); see [Benchmarks](#-benchmarks).
+FRIDAY Engine splits a model between the GPU and the CPU (**Elastic Tiered Memory**): as many transformer layers as fit are kept in VRAM and computed with custom CUDA kernels; the remaining layers stay in host RAM and are computed on the CPU with SIMD kernels, so no weights cross PCIe during generation. On an RTX 3060 12 GB + Ryzen 5 5600X, Qwen2.5-32B-Instruct Q2_K decodes at ~12.3 tok/s (llama.cpp b12189 in the same session: 9.7 tok/s); see [Benchmarks](#-benchmarks).
 
 ---
 
@@ -200,7 +200,10 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). GPU layers keep it in VRAM (fp16, 4 KiB per token per layer for Qwen2.5-32B), CPU layers in host RAM. | `2048` |
 | `--threads` | `<int>` | CPU threads for the CPU-computed layers. | `0` (2/3 of the logical CPUs) |
 | `--backend` | `auto` / `cuda` / `cpu` | `cpu` runs every layer, the embedding and the LM head on the CPU. `FRIDAY_BACKEND` sets the same for tools such as the golden test. | `auto` (CUDA if a device is present) |
+| `--kv` | `f16` / `q8` | GPU KV cache format. `q8` (int8 + fp16 scale per 32 values) halves its VRAM, which can fit more layers on the GPU; it changes numerics slightly. `FRIDAY_KV=q8` sets the same. | `f16` |
 | `--info` | | Capability report, then exit. | |
+
+A/B switches for development (environment variables): `FRIDAY_FUSED=0` (unfused GPU layer kernels), `FRIDAY_GRAPH=0` (no CUDA Graph), `FRIDAY_ATTN_SPLIT=0` (single-block attention), `FRIDAY_GEMV_FP32=1` (fp32-activation GEMV), `FRIDAY_OFFLOAD=stream` (stream non-resident layers over PCIe).
 | `<model_path>`| `<string>` | Path to the `.gguf` model file, or the id of a registered model (a converted `.bin` is still accepted, deprecated). | `friday_aligned_int4.bin` |
 
 ### Model registry
@@ -219,12 +222,19 @@ The registry is a JSON file: `%APPDATA%\friday\models.json` on Windows, `~/.conf
 
 Measured by the author on one machine: **RTX 3060 12 GB (PCIe 3.0 x16), Ryzen 5 5600X, 16 GB DDR4, Windows 11**, model **Qwen2.5-32B-Instruct Q2_K** (64 layers), the golden-test prompt (~50 tokens prompt, 32 generated, greedy), full VRAM, `--ctx 2048`. Median of 3 runs; desktop applications were open. A controlled benchmark tool (N repeats, median/p95, GPU clocks, free RAM) is planned (roadmap R5).
 
-| Engine | Layers GPU / CPU | Decode tok/s | Prefill tok/s |
-| :--- | :--- | ---: | ---: |
-| **FRIDAY** (this repo) | 57 / 7 | **~10.8** | ~10.2 |
-| llama.cpp b12189 (CUDA 12.4 build) | 50 / 14 | 8.3 | 73.5 |
+Same session, 2026-11-09 (decode: engine time for FRIDAY, llama-server timings for llama.cpp; median of 3):
 
-Meta-Llama-3.1-8B-Instruct Q4_K_M, which fits in VRAM entirely (same machine and method): FRIDAY ~52.8 tok/s decode, llama.cpp 58 tok/s; Qwen3-8B Q4_K_M: FRIDAY ~46.9, llama.cpp 55. With the whole model on the GPU FRIDAY is still behind; closing that gap is roadmap R4.
+| Model | Engine | Layers GPU / CPU | Decode tok/s |
+| :--- | :--- | :--- | ---: |
+| Qwen2.5-32B-Instruct Q2_K | **FRIDAY** | 57 / 7 | **12.25** |
+| | **FRIDAY** `--kv q8` | 58 / 6 | **12.92** |
+| | llama.cpp b12189 (`-ngl 50`) | 50 / 14 | 9.67 |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M | FRIDAY | 32 / 0 | 59.6 |
+| | llama.cpp b12189 | 32 / 0 | 61.0 |
+| Qwen3-8B Q4_K_M | FRIDAY | 36 / 0 | 58.1 |
+| | llama.cpp b12189 | 36 / 0 | 58.9 |
+
+GPU clocks on this desktop vary between sessions by up to ~15%, so only same-session numbers are compared. Prefill: FRIDAY ~10 tok/s on the 32B model (token by token), llama.cpp ~70 tok/s.
 
 - Prefill in FRIDAY is still token by token (batched prefill with tensor-core GEMM is on the roadmap), so llama.cpp is far ahead there.
 - Outputs are checked against llama.cpp on every change: 32/32 identical greedy tokens, max top-1 log-prob difference 0.27 (`ctest -L model`).

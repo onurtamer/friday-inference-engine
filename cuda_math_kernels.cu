@@ -358,6 +358,71 @@ __global__ void ropeKernel(half* d_query, half* d_key, int head_dim, int seq_len
     }
 }
 
+// RoPE (same math as ropeKernel) and the KV cache write for this position in
+// one launch: rotated K goes to k_dst, V is copied to v_dst.
+__global__ void ropeStoreKvKernel(half* d_query, half* d_key, const half* d_value, half* k_layer, half* v_layer,
+                                  const int* d_pos, int head_dim, int num_q_heads, int num_kv_heads, float freq_base,
+                                  int neox, const float* freq_factors) {
+    int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_head_dim = head_dim / 2;
+    if (pair_idx >= half_head_dim) return;
+    const int pos_offset = *d_pos;
+    half* k_dst = k_layer + (size_t)pos_offset * num_kv_heads * head_dim;
+    half* v_dst = v_layer + (size_t)pos_offset * num_kv_heads * head_dim;
+    float position = (float)pos_offset;
+    float theta = position / powf(freq_base, (2.0f * (float)pair_idx) / (float)head_dim);
+    if (freq_factors) theta /= freq_factors[pair_idx];
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+    const int off0 = neox ? pair_idx : 2 * pair_idx;
+    const int off1 = neox ? pair_idx + half_head_dim : 2 * pair_idx + 1;
+    for (int h = 0; h < num_q_heads + num_kv_heads; ++h) {
+        const bool is_k = h >= num_q_heads;
+        half* v = !is_k ? d_query + h * head_dim : d_key + (h - num_q_heads) * head_dim;
+        float x0 = __half2float(v[off0]);
+        float x1 = __half2float(v[off1]);
+        float res0 = x0 * cos_theta - x1 * sin_theta;
+        float res1 = x0 * sin_theta + x1 * cos_theta;
+        if (isnan(res0)) res0 = 0.0f; else if (res0 > 65504.0f) res0 = 65504.0f; else if (res0 < -65504.0f) res0 = -65504.0f;
+        if (isnan(res1)) res1 = 0.0f; else if (res1 > 65504.0f) res1 = 65504.0f; else if (res1 < -65504.0f) res1 = -65504.0f;
+        const half h0 = __float2half(res0), h1 = __float2half(res1);
+        v[off0] = h0;
+        v[off1] = h1;
+        if (is_k && k_layer) {
+            const int base = (h - num_q_heads) * head_dim;
+            k_dst[base + off0] = h0;
+            k_dst[base + off1] = h1;
+            v_dst[base + off0] = d_value[base + off0];
+            v_dst[base + off1] = d_value[base + off1];
+        }
+    }
+}
+
+// int8 KV cache write for one position: one warp per 32-value block of K or V
+// (K first, then V). Scale = fp16(amax / 127); values quantized with that
+// rounded scale so the stored pair dequantizes consistently.
+__global__ void storeKvQ8Kernel(const half* k, const half* v, int8_t* k_layer,
+                                half* ks_layer, int8_t* v_layer, half* vs_layer, const int* d_pos, int kv_dim) {
+    const int lane = threadIdx.x & 31;
+    const int blk = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int nblk = kv_dim / 32;
+    if (blk >= 2 * nblk) return;
+    const bool is_v = blk >= nblk;
+    const int b = is_v ? blk - nblk : blk;
+    const size_t pos = (size_t)*d_pos;
+    const float x = __half2float((is_v ? v : k)[b * 32 + lane]);
+    float amax = fabsf(isnan(x) ? 0.0f : x);
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const half dh = __float2half(amax / 127.0f);
+    const float d = __half2float(dh);
+    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = __float2int_rn((isnan(x) ? 0.0f : x) * inv);
+    q = max(-127, min(127, q));
+    int8_t* dst = (is_v ? v_layer : k_layer) + pos * kv_dim;
+    dst[b * 32 + lane] = (int8_t)q;
+    if (lane == 0) (is_v ? vs_layer : ks_layer)[pos * nblk + b] = dh;
+}
+
 // ============================================================
 // SiLU (Swish) Kernel - Named geluKernel for API compatibility
 // Qwen2.5 uses SwiGLU: SiLU(gate) * up

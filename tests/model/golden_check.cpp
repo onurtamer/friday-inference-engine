@@ -155,9 +155,16 @@ int main(int argc, char** argv) {
             }
         }
 
-        auto step = [&](int tok, int pos) { engine.step(tok, pos, logits.data()); };
+        // Engine time only (excludes this tool's per-step analysis of the logits).
+        double engine_s = 0.0;
+        auto step = [&](int tok, int pos) {
+            const auto a = std::chrono::steady_clock::now();
+            engine.step(tok, pos, logits.data());
+            engine_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+        };
 
         auto t0 = std::chrono::steady_clock::now();
+        double engine_prefill_s = 0.0;
         if (max_steps > 0) {
             for (int i = 0; i < max_steps && i < (int)prompt_len; ++i) {
                 auto ts = std::chrono::steady_clock::now();
@@ -170,6 +177,7 @@ int main(int argc, char** argv) {
         }
         for (size_t i = 0; i < prompt_len; ++i) step(tokens[i], (int)i);
         auto t1 = std::chrono::steady_clock::now();
+        engine_prefill_s = engine_s;
 
         std::vector<int> out;
         int next = argmaxLogits(logits, vocab, &nans); total_nans += nans;
@@ -215,6 +223,11 @@ int main(int argc, char** argv) {
         }
         printf("[GOLDEN] measured: prefill %.2f s (%.2f tok/s) | decode %.2f s (%.2f tok/s)\n",
                pre_s, prompt_len / pre_s, dec_s, (out.size() > 1 ? (out.size() - 1) / dec_s : 0.0));
+        {
+            const double eng_dec = engine_s - engine_prefill_s;
+            printf("[GOLDEN] engine only: decode %.2f s (%.2f tok/s)\n", eng_dec,
+                   (out.size() > 1 && eng_dec > 0 ? (out.size() - 1) / eng_dec : 0.0));
+        }
         printf("[GOLDEN] generated ids:");
         for (int t : out) printf(" %d", t);
         printf("\n");

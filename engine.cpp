@@ -146,8 +146,10 @@ struct Engine::Impl {
             eps = cfg.rms_norm_epsilon;
             if (qt == UNKNOWN) qt = Q4_K;  // informational only in the GGUF path
         }
+        bool kv_q8 = opt.kv_q8;
+        if (const char* e = std::getenv("FRIDAY_KV")) kv_q8 = std::strcmp(e, "q8") == 0;
         gpu.reset(new Transformer(opt.model_path, opt.tensor_map, hidden, heads, kv, layers, eps, qt, io.get(),
-                                  opt.vram_gb, opt.max_ctx, opt.cpu_threads));
+                                  opt.vram_gb, opt.max_ctx, opt.cpu_threads, kv_q8));
         vocab = gpu->getVocabSize();
         if (vocab <= 0) throw std::runtime_error("cannot determine the vocabulary size (no LM head tensor)");
         if (cudaMalloc(&d_act, (size_t)hidden * 2) != cudaSuccess || cudaMalloc(&d_logits, (size_t)vocab * 2) != cudaSuccess ||
