@@ -36,6 +36,10 @@ enum QuantType; // kernel_dispatcher.h'den
 bool launchDequantizeRow(const std::string& dtype, const uint8_t* d_row, half* d_out, int dim, cudaStream_t s);
 size_t embeddingRowBytes(const std::string& dtype, int dim);  // 0 if unsupported
 
+// GPU KV cache format: Auto picks fp16 if the whole model fits on the GPU with
+// it, otherwise int8 when that fits more layers.
+enum class KvCacheMode { Auto, F16, Q8 };
+
 class Transformer {
 public:
     Transformer(
@@ -51,12 +55,13 @@ public:
         double vram_limit_gb = 0.0,
         int max_context = 2048,
         int cpu_threads = 0,
-        bool kv_q8 = false      // int8 KV cache on the GPU (fused path only)
+        KvCacheMode kv_mode = KvCacheMode::Auto
     );
 
     ~Transformer();
 
     int getMaxContext() const { return max_ctx_; }
+    bool kvCacheInt8() const { return kv_q8_; }
     int getNumGpuLayers() const { return num_gpu_resident_layers_; }
     int getNumCpuLayers() const { return cpu_offload_ ? num_layers_ - num_gpu_resident_layers_ : 0; }
 
@@ -152,7 +157,8 @@ private:
     int* d_pos_ = nullptr;               // current position, read by the fused kernels
     void* d_attn_ws_ = nullptr;          // split-K attention partials (fused path)
     bool attn_split_ = true;
-    bool kv_q8_ = false;                 // GPU KV as int8 + fp16 scale per 32 values
+    KvCacheMode kv_mode_ = KvCacheMode::Auto;
+    bool kv_q8_ = false;                 // chosen format: int8 + fp16 scale per 32 values
     half* d_k_scale_ = nullptr;
     half* d_v_scale_ = nullptr;
     int* h_pos_ = nullptr;               // pinned staging for d_pos_

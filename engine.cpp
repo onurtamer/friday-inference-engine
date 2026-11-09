@@ -146,10 +146,14 @@ struct Engine::Impl {
             eps = cfg.rms_norm_epsilon;
             if (qt == UNKNOWN) qt = Q4_K;  // informational only in the GGUF path
         }
-        bool kv_q8 = opt.kv_q8;
-        if (const char* e = std::getenv("FRIDAY_KV")) kv_q8 = std::strcmp(e, "q8") == 0;
+        std::string kvs = opt.kv_cache;
+        if (const char* e = std::getenv("FRIDAY_KV")) kvs = e;
+        KvCacheMode kvm = KvCacheMode::Auto;
+        if (kvs == "f16") kvm = KvCacheMode::F16;
+        else if (kvs == "q8") kvm = KvCacheMode::Q8;
+        else if (kvs != "auto") throw std::runtime_error("unknown KV cache format '" + kvs + "' (auto, f16, q8)");
         gpu.reset(new Transformer(opt.model_path, opt.tensor_map, hidden, heads, kv, layers, eps, qt, io.get(),
-                                  opt.vram_gb, opt.max_ctx, opt.cpu_threads, kv_q8));
+                                  opt.vram_gb, opt.max_ctx, opt.cpu_threads, kvm));
         vocab = gpu->getVocabSize();
         if (vocab <= 0) throw std::runtime_error("cannot determine the vocabulary size (no LM head tensor)");
         if (cudaMalloc(&d_act, (size_t)hidden * 2) != cudaSuccess || cudaMalloc(&d_logits, (size_t)vocab * 2) != cudaSuccess ||
@@ -157,8 +161,8 @@ struct Engine::Impl {
             throw std::runtime_error("CUDA allocation failed for activation buffers");
         h_logits.resize(vocab);
         char buf[256];
-        std::snprintf(buf, sizeof(buf), "CUDA backend: %d/%d layers on the GPU, %d on the CPU", gpu->getNumGpuLayers(),
-                      layers, gpu->getNumCpuLayers());
+        std::snprintf(buf, sizeof(buf), "CUDA backend: %d/%d layers on the GPU, %d on the CPU, %s KV cache",
+                      gpu->getNumGpuLayers(), layers, gpu->getNumCpuLayers(), gpu->kvCacheInt8() ? "int8" : "fp16");
         summary = buf;
     }
 #endif

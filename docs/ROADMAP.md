@@ -103,7 +103,9 @@ recorded, docs updated, commit reviewed.
     attention: +13% decode at ~1500 context, neutral at short context;
     numerics change slightly (golden still passes, Qwen2.5 max diff 0.278 ->
     0.264). 4d optional int8 KV (`--kv q8`): Qwen2.5-32B 58/64 layers on the GPU,
-    12.04 -> 12.73 tok/s; Llama max diff 0.035 -> 0.073 (default stays f16).
+    12.04 -> 12.73 tok/s; Llama max diff 0.035 -> 0.073. `--kv auto` (default): fp16 if the
+    whole model fits on the GPU with it, otherwise int8 when that fits more layers;
+    `--kv f16|q8` forces a format.
     Versus llama.cpp in the same session (engine decode time): Llama 3.1 8B
     59.6 vs 61.0 tok/s, Qwen3 8B 58.1 vs 58.9.
   - Evaluated next (2026-11-08, measured with microbenchmarks):

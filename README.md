@@ -200,7 +200,7 @@ Tests labelled `known-failing` document open defects and are expected to fail un
 | `--ctx` | `<int>` | KV cache capacity in tokens (prompt + generated). GPU layers keep it in VRAM (fp16, 4 KiB per token per layer for Qwen2.5-32B), CPU layers in host RAM. | `2048` |
 | `--threads` | `<int>` | CPU threads for the CPU-computed layers. | `0` (2/3 of the logical CPUs) |
 | `--backend` | `auto` / `cuda` / `cpu` | `cpu` runs every layer, the embedding and the LM head on the CPU. `FRIDAY_BACKEND` sets the same for tools such as the golden test. | `auto` (CUDA if a device is present) |
-| `--kv` | `f16` / `q8` | GPU KV cache format. `q8` (int8 + fp16 scale per 32 values) halves its VRAM, which can fit more layers on the GPU; it changes numerics slightly. `FRIDAY_KV=q8` sets the same. | `f16` |
+| `--kv` | `auto` / `f16` / `q8` | GPU KV cache format. `q8` (int8 + fp16 scale per 32 values) halves its VRAM, which can fit more layers on the GPU, and changes numerics slightly. `auto` uses `f16` when the whole model fits on the GPU with it, otherwise `q8` if that fits more layers. `FRIDAY_KV` sets the same. | `auto` |
 | `--info` | | Capability report, then exit. | |
 
 A/B switches for development (environment variables): `FRIDAY_FUSED=0` (unfused GPU layer kernels), `FRIDAY_GRAPH=0` (no CUDA Graph), `FRIDAY_ATTN_SPLIT=0` (single-block attention), `FRIDAY_GEMV_FP32=1` (fp32-activation GEMV), `FRIDAY_OFFLOAD=stream` (stream non-resident layers over PCIe).

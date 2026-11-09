@@ -222,7 +222,7 @@ Transformer::Transformer(
     double vram_limit_gb,
     int max_context,
     int cpu_threads,
-    bool kv_q8
+    KvCacheMode kv_mode
 )
     : model_file_path_(model_file_path),
       hidden_dim_(model_hidden_dim),
@@ -235,7 +235,7 @@ Transformer::Transformer(
       async_io_manager_ptr_(async_io_manager_ptr),
       vram_limit_gb_(vram_limit_gb),
       max_ctx_(max_context),
-      kv_q8_(kv_q8)
+      kv_mode_(kv_mode)
 {
     if (max_ctx_ <= 0) throw std::runtime_error("max_context must be positive");
     if (hidden_dim_ % num_heads_ != 0) {
@@ -368,23 +368,18 @@ Transformer::Transformer(
     CUDA_CHECK(cudaMemGetInfo(&free_bytes_before_residency, &total_bytes));
 
     const size_t kMinGpuReserveBytes = 384ULL * 1024ULL * 1024ULL;
-    // GPU KV cache per layer (K + V, fp16). In CPU-offload mode only GPU layers
-    // need it, so it is charged per resident layer; in stream mode every layer
-    // is computed on the GPU and the whole cache is reserved up front.
-    // int8 KV (fused path only): 1 byte per value + one fp16 scale per 32 values.
+
+    // Fused path: every GEMV weight of every layer needs an int8-activation kernel.
+    // Decided before planning because the int8 KV cache depends on it.
     {
         const char* f = std::getenv("FRIDAY_FUSED");
         const char* fp32 = std::getenv("FRIDAY_GEMV_FP32");
-        if (kv_q8_ && ((f && f[0] == '0') || (fp32 && fp32[0] == '1'))) {
-            printf("[Transformer] int8 KV needs the fused GPU path; using fp16 KV\n");
-            kv_q8_ = false;
+        fused_ok_ = !(f && f[0] == '0') && !(fp32 && fp32[0] == '1');
+        for (const auto& [name, t] : full_tensor_map_) {
+            if (name.rfind("blk.", 0) != 0 || name.find(".weight") == std::string::npos || t.shape.size() < 2) continue;
+            if (friday_hpc::q8KindFromDtype(t.dtype) == friday_hpc::Q8Kind::None) { fused_ok_ = false; break; }
         }
     }
-    const size_t kv_elem = (size_t)max_ctx_ * num_kv_heads_ * head_dim_;
-    const size_t kv_layer_bytes = kv_q8_ ? 2ULL * (kv_elem + kv_elem / 32 * sizeof(half)) : 2ULL * kv_elem * sizeof(half);
-    const size_t dma_reservation = cpu_offload_ ? 0 : (size_t)kDmaSlotCount * layer_buffer_size_;
-    const size_t kv_reservation = cpu_offload_ ? 0 : (size_t)num_layers_ * kv_layer_bytes;
-    const size_t required_overhead = kMinGpuReserveBytes + dma_reservation + kv_reservation;
 
     size_t budget = free_bytes_before_residency;
     if (vram_limit_gb_ > 0.1) {
@@ -394,6 +389,57 @@ Transformer::Transformer(
         if (capped < budget) budget = capped;
     }
 
+    // GPU KV cache per layer (K + V). fp16, or int8 + one fp16 scale per 32 values
+    // (fused path only). In CPU-offload mode only GPU layers need it, so it is
+    // charged per resident layer; in stream mode every layer is computed on the
+    // GPU and the whole cache is reserved up front.
+    const size_t kv_elem = (size_t)max_ctx_ * num_kv_heads_ * head_dim_;
+    const size_t kv_bytes_f16 = 2ULL * kv_elem * sizeof(half);
+    const size_t kv_bytes_q8 = 2ULL * (kv_elem + kv_elem / 32 * sizeof(half));
+    const size_t dma_reservation = cpu_offload_ ? 0 : (size_t)kDmaSlotCount * layer_buffer_size_;
+    auto overheadFor = [&](size_t kv_layer) {
+        return kMinGpuReserveBytes + dma_reservation + (cpu_offload_ ? 0 : (size_t)num_layers_ * kv_layer);
+    };
+    auto residentFor = [&](size_t kv_layer) {
+        const size_t ov = overheadFor(kv_layer);
+        if (budget < ov) return -1;
+        size_t avail = budget - ov;
+        int n = 0;
+        for (int i = 0; i < num_layers_; ++i) {
+            const size_t l_size = layers_info_[i].size_bytes + (cpu_offload_ ? kv_layer : 0);
+            if (avail < l_size) break;
+            avail -= l_size;
+            ++n;
+        }
+        return n;
+    };
+
+    // KV format: f16 / q8 as requested; auto = f16 if every layer fits on the GPU
+    // with it, otherwise q8 (smaller cache, more GPU layers).
+    const char* kv_reason = "";
+    if (kv_mode_ == KvCacheMode::Q8 && !fused_ok_) {
+        kv_q8_ = false;
+        kv_reason = "int8 requested, but the fused GPU path is not available";
+    } else if (kv_mode_ == KvCacheMode::Q8) {
+        kv_q8_ = true;
+        kv_reason = "requested";
+    } else if (kv_mode_ == KvCacheMode::F16) {
+        kv_q8_ = false;
+        kv_reason = "requested";
+    } else if (!fused_ok_ || !cpu_offload_) {
+        kv_q8_ = false;
+        kv_reason = "auto: int8 needs the fused path and CPU offload";
+    } else if (residentFor(kv_bytes_f16) >= num_layers_) {
+        kv_q8_ = false;
+        kv_reason = "auto: the whole model fits on the GPU with fp16";
+    } else {
+        kv_q8_ = residentFor(kv_bytes_q8) > residentFor(kv_bytes_f16);
+        kv_reason = kv_q8_ ? "auto: int8 fits more layers on the GPU" : "auto: int8 would not fit more layers";
+    }
+    const size_t kv_layer_bytes = kv_q8_ ? kv_bytes_q8 : kv_bytes_f16;
+    const size_t required_overhead = overheadFor(kv_layer_bytes);
+    printf("[Transformer] KV cache format: %s (%s)\n", kv_q8_ ? "int8" : "fp16", kv_reason);
+
     if (budget < required_overhead) {
         throw std::runtime_error(
             "VRAM budget too small: " + std::to_string(budget / (1024 * 1024)) +
@@ -401,16 +447,9 @@ Transformer::Transformer(
             " MiB required for DMA slots and safety reserve");
     }
 
-    size_t available_for_resident = budget - required_overhead;
-    num_gpu_resident_layers_ = 0;
+    num_gpu_resident_layers_ = residentFor(kv_layer_bytes);
     size_t resident_weight_bytes = 0;
-    for (int i = 0; i < num_layers_; ++i) {
-        const size_t l_size = layers_info_[i].size_bytes + (cpu_offload_ ? kv_layer_bytes : 0);
-        if (available_for_resident < l_size) break;
-        available_for_resident -= l_size;
-        resident_weight_bytes += layers_info_[i].size_bytes;
-        num_gpu_resident_layers_++;
-    }
+    for (int i = 0; i < num_gpu_resident_layers_; ++i) resident_weight_bytes += layers_info_[i].size_bytes;
     const int num_streamed = num_layers_ - num_gpu_resident_layers_;
 
     printf("\n=======================================================\n");
@@ -440,15 +479,8 @@ Transformer::Transformer(
                kv_q8_ ? "int8" : "fp16", (double)(kv_layers > 0 ? kv_layers : 1) * kv_layer_bytes / (1024.0 * 1024.0));
     }
 
-    // Fused path: every GEMV weight of every layer needs an int8-activation kernel.
+    // Fused-path resources (fused_ok_ was decided before planning).
     {
-        const char* f = std::getenv("FRIDAY_FUSED");
-        const char* fp32 = std::getenv("FRIDAY_GEMV_FP32");
-        fused_ok_ = !(f && f[0] == '0') && !(fp32 && fp32[0] == '1');
-        for (const auto& [name, t] : full_tensor_map_) {
-            if (name.rfind("blk.", 0) != 0 || name.find(".weight") == std::string::npos || t.shape.size() < 2) continue;
-            if (friday_hpc::q8KindFromDtype(t.dtype) == friday_hpc::Q8Kind::None) { fused_ok_ = false; break; }
-        }
         if (fused_ok_) friday_hpc::ensureQ8Scratch(std::max(hidden_dim_, max_intermediate_size_), nullptr);
         CUDA_CHECK(cudaMalloc((void**)&d_pos_, sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_attn_ws_, friday_attn::splitAttentionWorkspaceBytes(num_heads_, max_ctx_)));
