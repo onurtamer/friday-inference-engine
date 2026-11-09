@@ -1,0 +1,258 @@
+{
+ "date_utc": "2026-11-09T17:45:29Z",
+ "engine": "CUDA backend: 58/64 layers on the GPU, 6 on the CPU, int8 KV cache",
+ "git_rev": "d750d3d",
+ "label": "",
+ "load_s": 6.6701451,
+ "model": {
+  "architecture": "qwen2",
+  "file_bytes": 12313099136,
+  "file_type": "Q2_K",
+  "layers": 64,
+  "name": "Qwen2.5 32B Instruct",
+  "path": "Qwen2.5-32B-Instruct-Q2_K.gguf"
+ },
+ "options": {
+  "backend": "auto",
+  "ctx": 2048,
+  "gen_tokens": 32,
+  "kv": "auto",
+  "prompt_tokens": 64,
+  "runs": 3,
+  "threads": 0,
+  "vram_gb": 0.0,
+  "warmup": 1
+ },
+ "prompt_ids": [
+  785,
+  3974,
+  13876,
+  38835,
+  34208,
+  916,
+  279,
+  15678,
+  5562,
+  13,
+  758,
+  220,
+  16,
+  24,
+  21,
+  24,
+  11,
+  35150,
+  220,
+  16,
+  16,
+  26120,
+  389,
+  279,
+  17330,
+  26,
+  279,
+  8954,
+  35413,
+  220,
+  23,
+  2849,
+  11,
+  220,
+  18,
+  4115,
+  323,
+  220,
+  16,
+  23,
+  4420,
+  13,
+  36819,
+  20896,
+  21780,
+  305,
+  449,
+  1933,
+  404,
+  1515,
+  258,
+  80338,
+  993,
+  24836,
+  389,
+  84,
+  8328,
+  6226,
+  17149,
+  404,
+  13,
+  526,
+  1887,
+  368
+ ],
+ "runs": [
+  {
+   "cpu_busy_before_pct": 14.48717948717949,
+   "cpu_busy_during_pct": 44.796163069544356,
+   "decode_ms_max": 82.9575,
+   "decode_ms_p50": 81.3617,
+   "decode_ms_p95": 82.85794999999999,
+   "decode_tok_s": 12.249673477050454,
+   "free_ram_mb_before": 6424.77734375,
+   "prefill_tok_s": 11.384697042449604,
+   "run": 0,
+   "telemetry": {
+    "count": 27,
+    "free_ram_mb": {
+     "max": 6749.81640625,
+     "median": 6711.80859375,
+     "min": 6429.75
+    },
+    "mem_mhz": {
+     "max": 7301.0,
+     "median": 7301.0,
+     "min": 7301.0
+    },
+    "power_w": {
+     "max": 126.285,
+     "median": 122.624,
+     "min": 51.784
+    },
+    "sm_mhz": {
+     "max": 1860.0,
+     "median": 1807.0,
+     "min": 1672.0
+    },
+    "temp_c": {
+     "max": 69.0,
+     "median": 68.0,
+     "min": 63.0
+    },
+    "util_gpu": {
+     "max": 69.0,
+     "median": 57.0,
+     "min": 2.0
+    }
+   }
+  },
+  {
+   "cpu_busy_before_pct": 2.9487179487179493,
+   "cpu_busy_during_pct": 37.41531165311653,
+   "decode_ms_max": 88.9238,
+   "decode_ms_p50": 81.3787,
+   "decode_ms_p95": 84.5572,
+   "decode_tok_s": 12.199443587313286,
+   "free_ram_mb_before": 6759.546875,
+   "prefill_tok_s": 12.4243502666615,
+   "run": 1,
+   "telemetry": {
+    "count": 25,
+    "free_ram_mb": {
+     "max": 6781.1796875,
+     "median": 6760.40625,
+     "min": 6756.15625
+    },
+    "mem_mhz": {
+     "max": 7301.0,
+     "median": 7301.0,
+     "min": 7301.0
+    },
+    "power_w": {
+     "max": 129.375,
+     "median": 124.464,
+     "min": 51.305
+    },
+    "sm_mhz": {
+     "max": 1860.0,
+     "median": 1822.0,
+     "min": 1657.0
+    },
+    "temp_c": {
+     "max": 70.0,
+     "median": 69.0,
+     "min": 63.0
+    },
+    "util_gpu": {
+     "max": 65.0,
+     "median": 56.0,
+     "min": 3.0
+    }
+   }
+  },
+  {
+   "cpu_busy_before_pct": 4.61538461538461,
+   "cpu_busy_during_pct": 38.25219743069642,
+   "decode_ms_max": 104.1507,
+   "decode_ms_p50": 81.2266,
+   "decode_ms_p95": 83.35505,
+   "decode_tok_s": 12.146406832298988,
+   "free_ram_mb_before": 6777.06640625,
+   "prefill_tok_s": 12.415837355013815,
+   "run": 2,
+   "telemetry": {
+    "count": 25,
+    "free_ram_mb": {
+     "max": 6853.48828125,
+     "median": 6779.95703125,
+     "min": 6708.07421875
+    },
+    "mem_mhz": {
+     "max": 7301.0,
+     "median": 7301.0,
+     "min": 7301.0
+    },
+    "power_w": {
+     "max": 127.949,
+     "median": 125.713,
+     "min": 64.948
+    },
+    "sm_mhz": {
+     "max": 1860.0,
+     "median": 1792.0,
+     "min": 1657.0
+    },
+    "temp_c": {
+     "max": 71.0,
+     "median": 69.0,
+     "min": 64.0
+    },
+    "util_gpu": {
+     "max": 67.0,
+     "median": 63.0,
+     "min": 2.0
+    }
+   }
+  }
+ ],
+ "summary": {
+  "decode_ms_p50": 81.3246,
+  "decode_ms_p95": 83.35082,
+  "decode_tok_s_max": 12.249673477050454,
+  "decode_tok_s_median": 12.199443587313286,
+  "decode_tok_s_min": 12.146406832298988,
+  "output_identical_across_runs": true,
+  "prefill_tok_s_median": 12.415837355013815
+ },
+ "system": {
+  "arch": "x86_64",
+  "cpu": "AMD Ryzen 5 5600X 6-Core Processor",
+  "cpu_features": [
+   "SSE4.1",
+   "AVX",
+   "FMA",
+   "F16C",
+   "AVX2"
+  ],
+  "gpu": {
+   "driver": "610.74",
+   "mem_clock_max_mhz": 7501,
+   "memory_bytes": 12884901888,
+   "name": "NVIDIA GeForce RTX 3060",
+   "pcie_gen_max": 3,
+   "pcie_width_max": 16,
+   "sm_clock_max_mhz": 2100
+  },
+  "logical_cpus": 12,
+  "ram_total_bytes": 17099763712
+ },
+ "tool": "friday-bench"
+}

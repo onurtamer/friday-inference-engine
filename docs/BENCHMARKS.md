@@ -54,8 +54,35 @@ were identical across runs.
 
 ## Measured results
 
-To be filled from a quiet-machine session with the tools above (the numbers in
-the README are from 2026-11-09, same session, golden-test prompt, median of 3).
+RTX 3060 12 GB (PCIe 3.0 x16, driver 610.74), Ryzen 5 5600X, 16 GB DDR4-3200,
+Windows 11; 2026-11-09, background CPU load 5-13% before runs; FRIDAY at
+git 29535da, llama.cpp b12189-80d2c0c2c. Prompt 512 tokens, 128 generated,
+greedy, 1 warmup + 5 runs (3 where noted). Raw JSON: `docs/bench/2026-11-09-rtx3060/`.
+
+| Model | Engine | Layers GPU/CPU | Decode tok/s (median, min-max) | p95 token | Prefill tok/s |
+| :--- | :--- | :--- | :--- | ---: | ---: |
+| Llama 3.1 8B Q4_K_M | FRIDAY | 32/0, fp16 KV | 50.0 (49.0-50.5) | 22.0 ms | 51 |
+| | llama.cpp | 32/0 | 55.4 (54.2-55.7) | | 1944 |
+| Qwen3 8B Q4_K_M | FRIDAY | 36/0, fp16 KV | 47.4 (46.4-47.6) | 23.1 ms | 49 |
+| | llama.cpp | 36/0 | 53.2 (52.9-55.9) | | 1816 |
+| Qwen2.5-32B Q2_K | FRIDAY `--kv auto` (int8), ctx 2048 | 58/6 | 10.66 (10.52-10.71) | 100.6 ms | 11.1 |
+| | FRIDAY ctx 704, `--vram 11.8` (3 runs) | 58/6, fp16 KV | 10.85 (10.85-10.93) | 95.1 ms | |
+| | llama.cpp `-ngl 58`, `-c 704` (3 runs) | 58/6 | 11.66 | | 325 |
+
+llama.cpp `-ngl` sweep on Qwen2.5-32B (3 runs each, `-c 704`): 50: 8.27,
+54: 9.61, 56: 10.99, **58: 11.66**, 60: 10.19, 62: 7.81 tok/s (above 58 the
+weights no longer fit and it slows down). Comparisons must use each engine at
+its best setting; an earlier comparison at `-ngl 50` overstated FRIDAY.
+
+Short context (64-token prompt, 32 generated), Qwen2.5-32B, interleaved rounds
+FRIDAY / llama.cpp `-ngl 58`, 3 runs each: 9.18 / 13.15, 12.20 / 13.26,
+12.16 / 13.25 tok/s. FRIDAY's split GPU+CPU runs vary between rounds (cause not
+identified yet; GPU clocks and CPU load were normal), llama.cpp's do not.
+
+Findings to act on: FRIDAY is ~10% slower than llama.cpp at a 512-640 token
+context on all three models and closer at short context (~2% on the 8B models
+in earlier same-session runs), which points at attention cost growing with
+context; split GPU+CPU runs are not stable; prefill needs batching (R4b).
 
 ## Estimates
 

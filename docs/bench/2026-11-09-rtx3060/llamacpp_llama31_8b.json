@@ -1,0 +1,124 @@
+{
+ "tool": "llama_cpp_bench.py",
+ "server_cmd": [
+  "llama-server.exe",
+  "-m",
+  "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "-ngl",
+  "99",
+  "-c",
+  "704",
+  "-np",
+  "1",
+  "--load-mode",
+  "none",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "8089"
+ ],
+ "build": "b12189-80d2c0c2c",
+ "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+ "prompt_tokens": 512,
+ "gen_tokens": 128,
+ "runs": [
+  {
+   "run": 0,
+   "prefill_tok_s": 1937.1119628013969,
+   "decode_tok_s": 55.4058434405371,
+   "decode_ms_per_token": 18.048637795275592,
+   "gpu_before": {
+    "sm_mhz": 1807.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 72.0,
+    "power_w": 168.95
+   },
+   "gpu_after": {
+    "sm_mhz": 1822.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 73.0,
+    "power_w": 169.25
+   }
+  },
+  {
+   "run": 1,
+   "prefill_tok_s": 1944.1290719441668,
+   "decode_tok_s": 55.62402712700585,
+   "decode_ms_per_token": 17.97784251968504,
+   "gpu_before": {
+    "sm_mhz": 1852.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 69.0,
+    "power_w": 166.46
+   },
+   "gpu_after": {
+    "sm_mhz": 1807.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 73.0,
+    "power_w": 169.02
+   }
+  },
+  {
+   "run": 2,
+   "prefill_tok_s": 1954.7729676278907,
+   "decode_tok_s": 54.918538942000836,
+   "decode_ms_per_token": 18.208787401574803,
+   "gpu_before": {
+    "sm_mhz": 1807.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 73.0,
+    "power_w": 169.02
+   },
+   "gpu_after": {
+    "sm_mhz": 1837.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 74.0,
+    "power_w": 168.86
+   }
+  },
+  {
+   "run": 3,
+   "prefill_tok_s": 1964.1165120052783,
+   "decode_tok_s": 54.159861146056784,
+   "decode_ms_per_token": 18.463858267716535,
+   "gpu_before": {
+    "sm_mhz": 1837.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 74.0,
+    "power_w": 168.86
+   },
+   "gpu_after": {
+    "sm_mhz": 1845.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 74.0,
+    "power_w": 166.75
+   }
+  },
+  {
+   "run": 4,
+   "prefill_tok_s": 1823.74501764972,
+   "decode_tok_s": 55.7034645800529,
+   "decode_ms_per_token": 17.952204724409448,
+   "gpu_before": {
+    "sm_mhz": 1852.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 72.0,
+    "power_w": 167.26
+   },
+   "gpu_after": {
+    "sm_mhz": 1800.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 75.0,
+    "power_w": 169.52
+   }
+  }
+ ],
+ "summary": {
+  "decode_tok_s_median": 55.4058434405371,
+  "decode_tok_s_min": 54.159861146056784,
+  "decode_tok_s_max": 55.7034645800529,
+  "prefill_tok_s_median": 1944.1290719441668,
+  "output_identical_across_runs": true
+ },
+ "friday_bench_file": "friday_llama31_8b.json"
+}

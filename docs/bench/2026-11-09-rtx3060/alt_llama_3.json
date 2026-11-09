@@ -1,0 +1,88 @@
+{
+ "tool": "llama_cpp_bench.py",
+ "server_cmd": [
+  "llama-server.exe",
+  "-m",
+  "Qwen2.5-32B-Instruct-Q2_K.gguf",
+  "-ngl",
+  "58",
+  "-c",
+  "160",
+  "-np",
+  "1",
+  "--load-mode",
+  "none",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "8089"
+ ],
+ "build": "b12189-80d2c0c2c",
+ "model": "Qwen2.5-32B-Instruct-Q2_K.gguf",
+ "prompt_tokens": 64,
+ "gen_tokens": 32,
+ "runs": [
+  {
+   "run": 0,
+   "prefill_tok_s": 201.19143050250702,
+   "decode_tok_s": 12.999129896950445,
+   "decode_ms_per_token": 76.92822580645162,
+   "gpu_before": {
+    "sm_mhz": 1815.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 69.0,
+    "power_w": 119.2
+   },
+   "gpu_after": {
+    "sm_mhz": 1815.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 69.0,
+    "power_w": 118.63
+   }
+  },
+  {
+   "run": 1,
+   "prefill_tok_s": 205.54786535330146,
+   "decode_tok_s": 13.245202886599701,
+   "decode_ms_per_token": 75.4990322580645,
+   "gpu_before": {
+    "sm_mhz": 1860.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 68.0,
+    "power_w": 117.0
+   },
+   "gpu_after": {
+    "sm_mhz": 1815.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 71.0,
+    "power_w": 122.14
+   }
+  },
+  {
+   "run": 2,
+   "prefill_tok_s": 204.86227813255232,
+   "decode_tok_s": 13.279120253999583,
+   "decode_ms_per_token": 75.3061935483871,
+   "gpu_before": {
+    "sm_mhz": 1815.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 71.0,
+    "power_w": 122.14
+   },
+   "gpu_after": {
+    "sm_mhz": 1860.0,
+    "mem_mhz": 7301.0,
+    "temp_c": 68.0,
+    "power_w": 118.93
+   }
+  }
+ ],
+ "summary": {
+  "decode_tok_s_median": 13.245202886599701,
+  "decode_tok_s_min": 12.999129896950445,
+  "decode_tok_s_max": 13.279120253999583,
+  "prefill_tok_s_median": 204.86227813255232,
+  "output_identical_across_runs": true
+ },
+ "friday_bench_file": "alt_friday_3.json"
+}

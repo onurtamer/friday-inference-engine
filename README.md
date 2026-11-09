@@ -28,7 +28,7 @@
 
 Modern cloud and edge LLM deployments are heavily constrained by high memory demands and runtime overhead. Running a **14-Billion parameter** model (like `Qwen2.5-14B-Instruct`) typically requires 10 GB – 16 GB of dedicated GPU VRAM. 
 
-FRIDAY Engine splits a model between the GPU and the CPU (**Elastic Tiered Memory**): as many transformer layers as fit are kept in VRAM and computed with custom CUDA kernels; the remaining layers stay in host RAM and are computed on the CPU with SIMD kernels, so no weights cross PCIe during generation. On an RTX 3060 12 GB + Ryzen 5 5600X, Qwen2.5-32B-Instruct Q2_K decodes at ~12.3 tok/s (llama.cpp b12189 in the same session: 9.7 tok/s); see [Benchmarks](#-benchmarks).
+FRIDAY Engine splits a model between the GPU and the CPU (**Elastic Tiered Memory**): as many transformer layers as fit are kept in VRAM and computed with custom CUDA kernels; the remaining layers stay in host RAM and are computed on the CPU with SIMD kernels, so no weights cross PCIe during generation. On an RTX 3060 12 GB + Ryzen 5 5600X it decodes Qwen2.5-32B-Instruct Q2_K at ~10.7 tok/s and 8B models at ~47-50 tok/s, about 90% of llama.cpp b12189 at its best settings; see [Benchmarks](#-benchmarks).
 
 ---
 
@@ -222,19 +222,17 @@ The registry is a JSON file: `%APPDATA%\friday\models.json` on Windows, `~/.conf
 
 Measured by the author on one machine: **RTX 3060 12 GB (PCIe 3.0 x16), Ryzen 5 5600X, 16 GB DDR4, Windows 11**, model **Qwen2.5-32B-Instruct Q2_K** (64 layers), the golden-test prompt (~50 tokens prompt, 32 generated, greedy), full VRAM, `--ctx 2048`. Median of 3 runs; desktop applications were open. A controlled benchmark tool (N repeats, median/p95, GPU clocks, free RAM) is planned (roadmap R5).
 
-Same session, 2026-11-09 (decode: engine time for FRIDAY, llama-server timings for llama.cpp; median of 3):
+Measured 2026-11-09 with `friday-bench` and `tools/bench/llama_cpp_bench.py` (quiet machine, same prompt tokens, greedy, 512-token prompt + 128 generated, median of 5 runs; llama.cpp at its fastest `-ngl` for the model):
 
-| Model | Engine | Layers GPU / CPU | Decode tok/s |
-| :--- | :--- | :--- | ---: |
-| Qwen2.5-32B-Instruct Q2_K | **FRIDAY** | 57 / 7 | **12.25** |
-| | **FRIDAY** `--kv q8` | 58 / 6 | **12.92** |
-| | llama.cpp b12189 (`-ngl 50`) | 50 / 14 | 9.67 |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M | FRIDAY | 32 / 0 | 59.6 |
-| | llama.cpp b12189 | 32 / 0 | 61.0 |
-| Qwen3-8B Q4_K_M | FRIDAY | 36 / 0 | 58.1 |
-| | llama.cpp b12189 | 36 / 0 | 58.9 |
+| Model | FRIDAY decode | llama.cpp b12189 decode | FRIDAY / llama.cpp |
+| :--- | ---: | ---: | ---: |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M (all on GPU) | 50.0 tok/s | 55.4 tok/s | 90% |
+| Qwen3-8B Q4_K_M (all on GPU) | 47.4 tok/s | 53.2 tok/s | 89% |
+| Qwen2.5-32B-Instruct Q2_K (GPU + CPU) | 10.7 tok/s (58/64 on GPU) | 11.7 tok/s (`-ngl 58`) | 92% |
 
-GPU clocks on this desktop vary between sessions by up to ~15%, so only same-session numbers are compared. Method, tools (`friday-bench`, llama.cpp comparison script) and estimates for other hardware: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Prefill: FRIDAY ~10 tok/s on the 32B model (token by token), llama.cpp ~70 tok/s.
+**llama.cpp is currently faster on this machine.** Earlier README figures that showed FRIDAY ahead on the 32B model compared against llama.cpp at `-ngl 50`, which is well below its best setting here (`-ngl` 50: 8.3, 56: 11.0, 58: 11.7, 60: 10.2 tok/s); they were wrong and are withdrawn. FRIDAY's 32B results also vary more between runs (9.2-12.2 tok/s in interleaved runs, llama.cpp 13.2 stable, short context). Prefill is far behind: FRIDAY ~50 tok/s (8B) and ~11 tok/s (32B), one token at a time; llama.cpp ~1800-1950 and ~300 tok/s (batched). Raw results: [docs/bench/2026-11-09-rtx3060](docs/bench/2026-11-09-rtx3060).
+
+Method, tools (`friday-bench`, llama.cpp comparison script) and estimates for other hardware: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Prefill: FRIDAY ~10 tok/s on the 32B model (token by token), llama.cpp ~70 tok/s.
 
 - Prefill in FRIDAY is still token by token (batched prefill with tensor-core GEMM is on the roadmap), so llama.cpp is far ahead there.
 - Outputs are checked against llama.cpp on every change: 32/32 identical greedy tokens, max top-1 log-prob difference 0.27 (`ctest -L model`).

@@ -80,7 +80,10 @@ recorded, docs updated, commit reviewed.
   - [x] `tools/bench/llama_cpp_bench.py`: llama-server on the same prompt ids.
   - [x] `tools/bench/estimate.py`: bandwidth model calibrated on the RTX 3060 +
         5600X (within ~3% there); estimate table in docs/BENCHMARKS.md.
-  - [ ] Measured table from a quiet-machine session (needs the dev box idle).
+  - [x] Measured table (quiet machine, 2026-11-09), raw JSON in docs/bench/:
+        FRIDAY ~89-92% of llama.cpp decode at a 512-token prompt; prefill far behind.
+- **Open performance items (from R5):** decode cost growing with context (attention);
+  run-to-run instability of split GPU+CPU decode; batched prefill (R4b).
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).
@@ -114,8 +117,12 @@ recorded, docs updated, commit reviewed.
     12.04 -> 12.73 tok/s; Llama max diff 0.035 -> 0.073. `--kv auto` (default): fp16 if the
     whole model fits on the GPU with it, otherwise int8 when that fits more layers;
     `--kv f16|q8` forces a format.
-    Versus llama.cpp in the same session (engine decode time): Llama 3.1 8B
-    59.6 vs 61.0 tok/s, Qwen3 8B 58.1 vs 58.9.
+    Versus llama.cpp in the same session (engine decode time, short context):
+    Llama 3.1 8B 59.6 vs 61.0 tok/s, Qwen3 8B 58.1 vs 58.9.
+  - **Correction (2026-11-09, R5 measurements):** every "FRIDAY ahead of llama.cpp
+    on Qwen2.5-32B" figure above (8.3, 9.67 tok/s for llama.cpp) used `-ngl 50`;
+    llama.cpp's best on this machine is `-ngl 58` at 11.7 tok/s (512-token prompt)
+    and 13.2 (short), ahead of FRIDAY's 10.7 / 9.2-12.2. See docs/BENCHMARKS.md.
   - Evaluated next (2026-11-08, measured with microbenchmarks):
     CUDA Graph of the GPU phase −4.5 ms/token (45.3 → 40.8 ms; GEMV-only floor
     39 ms); split-K decode attention: +7 ms at 1024 context today, mostly
