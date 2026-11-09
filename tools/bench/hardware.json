@@ -1,0 +1,69 @@
+{
+  "_note": "Bandwidths are theoretical peaks from spec sheets (GB/s, 1e9 bytes/s) unless 'basis' says measured. Calibration: see 'calibration_source'.",
+  "calibration": {
+    "calibration_source": "RTX 3060 12 GB + Ryzen 5 5600X (DDR4-3200 dual channel), 2026-11-09: GEMV ~300 GB/s of 360 (e_gpu), CPU K-quant GEMV ~34 GB/s of 51.2 (e_cpu). usable_vram_fraction reproduces the 57/7 split of Qwen2.5-32B on a desktop whose display uses ~1.2 GB; t_fixed_gpu_ms fitted to Llama 3.1 8B (59.6 tok/s, all GPU); t_cpu_layer_ms to Llama 3.1 8B fully on the CPU (6.9 tok/s); t_handoff_ms (GPU+CPU split only) to Qwen2.5-32B 57/7 (12.25 tok/s).",
+    "e_gpu": 0.83,
+    "e_cpu": 0.66,
+    "usable_vram_fraction": 0.91,
+    "t_fixed_gpu_ms": 1.3,
+    "t_fixed_cpu_ms": 1.0,
+    "t_cpu_layer_ms": 0.25,
+    "t_handoff_ms": 6.6
+  },
+  "hardware": [
+    {
+      "name": "RTX 3060 12GB + DDR4-3200 2ch",
+      "vram_gb": 12,
+      "gpu_bw_gbs": 360,
+      "cpu_bw_gbs": 51.2,
+      "basis": "measured device (calibration)"
+    },
+    {
+      "name": "RTX 4060 Ti 16GB + DDR5-6000 2ch",
+      "vram_gb": 16,
+      "gpu_bw_gbs": 288,
+      "cpu_bw_gbs": 96
+    },
+    {
+      "name": "RTX 4070 12GB + DDR5-6000 2ch",
+      "vram_gb": 12,
+      "gpu_bw_gbs": 504,
+      "cpu_bw_gbs": 96
+    },
+    {
+      "name": "RTX 3090 24GB + DDR4-3200 2ch",
+      "vram_gb": 24,
+      "gpu_bw_gbs": 936,
+      "cpu_bw_gbs": 51.2
+    },
+    {
+      "name": "RTX 4090 24GB + DDR5-6000 2ch",
+      "vram_gb": 24,
+      "gpu_bw_gbs": 1008,
+      "cpu_bw_gbs": 96
+    },
+    {
+      "name": "CPU only: DDR4-3200 2ch (5600X)",
+      "cpu_bw_gbs": 51.2,
+      "min_ram_gb": 16,
+      "basis": "spec sheet; CPU backend measured on Llama 8B"
+    },
+    {
+      "name": "CPU only: DDR5-6000 2ch",
+      "cpu_bw_gbs": 96,
+      "min_ram_gb": 32
+    },
+    {
+      "name": "Radxa Orion O6 (CIX P1, LPDDR5, 64 GB)",
+      "cpu_bw_gbs": 96,
+      "min_ram_gb": 64,
+      "basis": "spec sheet, unverified; assumes NEON kernels as efficient as AVX2 (not written yet)"
+    },
+    {
+      "name": "Raspberry Pi 5 (LPDDR4X-4267, 8 GB)",
+      "cpu_bw_gbs": 17,
+      "min_ram_gb": 8,
+      "basis": "spec sheet, unverified; assumes NEON kernels (not written yet)"
+    }
+  ]
+}

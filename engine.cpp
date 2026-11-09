@@ -9,23 +9,13 @@
 
 #include "cpu_backend.h"
 #include "cpu_kquants.h"
+#include "gpu_monitor.h"
 #include "gguf_file.h"
 #include "io_manager.h"
 #include "model_config.h"
 #include "model_layout.h"
 
 #if FRIDAY_HAVE_CUDA
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#define WIN32_LEAN_AND_MEAN
-#define INT8 WIN_INT8   // windows.h's INT8 typedef clashes with QuantType::INT8
-#include <windows.h>
-#undef INT8
-#else
-#include <dlfcn.h>
-#endif
 #include <cuda_runtime.h>
 #include "kernel_dispatcher.h"
 #include "transformer.h"
@@ -194,46 +184,13 @@ int Engine::maxContext() const { return impl_->opt.max_ctx; }
 bool Engine::usesCuda() const { return impl_->kind == BackendKind::Cuda; }
 std::string Engine::summary() const { return impl_->summary; }
 
-#if FRIDAY_HAVE_CUDA
-namespace {
-// NVML is loaded at run time (it ships with the driver), so the build does not
-// depend on it. Only PCIe link generation and width are read.
-struct Nvml {
-    typedef int (*InitFn)();
-    typedef int (*HandleFn)(unsigned, void**);
-    typedef int (*BusFn)(const char*, void**);
-    typedef int (*UIntFn)(void*, unsigned*);
-    InitFn init = nullptr, shutdown = nullptr;
-    BusFn by_bus = nullptr;
-    UIntFn max_gen = nullptr, max_width = nullptr;
-    void* lib = nullptr;
-    Nvml() {
-#if defined(_WIN32)
-        lib = (void*)LoadLibraryA("nvml.dll");
-        auto sym = [&](const char* n) { return lib ? (void*)GetProcAddress((HMODULE)lib, n) : nullptr; };
-#else
-        lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
-        auto sym = [&](const char* n) { return lib ? dlsym(lib, n) : nullptr; };
-#endif
-        init = (InitFn)sym("nvmlInit_v2");
-        shutdown = (InitFn)sym("nvmlShutdown");
-        by_bus = (BusFn)sym("nvmlDeviceGetHandleByPciBusId_v2");
-        max_gen = (UIntFn)sym("nvmlDeviceGetMaxPcieLinkGeneration");
-        max_width = (UIntFn)sym("nvmlDeviceGetMaxPcieLinkWidth");
-        if (!(init && shutdown && by_bus && max_gen && max_width) || init() != 0) init = nullptr;
-    }
-    ~Nvml() { if (init && shutdown) shutdown(); }
-    bool ok() const { return init != nullptr; }
-};
-}  // namespace
-#endif
 
 std::vector<Engine::GpuInfo> Engine::gpuInfo() {
     std::vector<GpuInfo> out;
 #if FRIDAY_HAVE_CUDA
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess) { cudaGetLastError(); return out; }
-    Nvml nvml;
+    const GpuMonitor nvml;  // PCIe link via NVML (loaded at run time)
     for (int i = 0; i < n; ++i) {
         cudaDeviceProp p;
         if (cudaGetDeviceProperties(&p, i) != cudaSuccess) continue;
@@ -244,14 +201,11 @@ std::vector<Engine::GpuInfo> Engine::gpuInfo() {
         g.multiprocessors = p.multiProcessorCount;
         size_t fr = 0, tot = 0;
         if (cudaSetDevice(i) == cudaSuccess && cudaMemGetInfo(&fr, &tot) == cudaSuccess) { g.free_bytes = fr; g.total_bytes = tot; }
-        if (nvml.ok()) {
-            char bus[32];
-            void* h = nullptr;
-            unsigned v = 0;
-            if (cudaDeviceGetPCIBusId(bus, sizeof(bus), i) == cudaSuccess && nvml.by_bus(bus, &h) == 0) {
-                if (nvml.max_gen(h, &v) == 0) g.pcie_gen_max = (int)v;
-                if (nvml.max_width(h, &v) == 0) g.pcie_width_max = (int)v;
-            }
+        char bus[32];
+        GpuStatic st;
+        if (cudaDeviceGetPCIBusId(bus, sizeof(bus), i) == cudaSuccess && nvml.staticInfoByBusId(bus, &st)) {
+            g.pcie_gen_max = st.pcie_gen_max;
+            g.pcie_width_max = st.pcie_width_max;
         }
         out.push_back(g);
     }

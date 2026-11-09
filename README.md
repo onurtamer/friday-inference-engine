@@ -234,7 +234,7 @@ Same session, 2026-11-09 (decode: engine time for FRIDAY, llama-server timings f
 | Qwen3-8B Q4_K_M | FRIDAY | 36 / 0 | 58.1 |
 | | llama.cpp b12189 | 36 / 0 | 58.9 |
 
-GPU clocks on this desktop vary between sessions by up to ~15%, so only same-session numbers are compared. Prefill: FRIDAY ~10 tok/s on the 32B model (token by token), llama.cpp ~70 tok/s.
+GPU clocks on this desktop vary between sessions by up to ~15%, so only same-session numbers are compared. Method, tools (`friday-bench`, llama.cpp comparison script) and estimates for other hardware: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Prefill: FRIDAY ~10 tok/s on the 32B model (token by token), llama.cpp ~70 tok/s.
 
 - Prefill in FRIDAY is still token by token (batched prefill with tensor-core GEMM is on the roadmap), so llama.cpp is far ahead there.
 - Outputs are checked against llama.cpp on every change: 32/32 identical greedy tokens, max top-1 log-prob difference 0.27 (`ctest -L model`).

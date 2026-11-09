@@ -129,4 +129,30 @@ MemoryInfo memoryInfo() {
     return m;
 }
 
+CpuTimes cpuTimes() {
+    CpuTimes t;
+#if defined(_WIN32)
+    FILETIME idle, kernel, user;
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+        auto u64 = [](const FILETIME& f) { return ((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime; };
+        t.idle = u64(idle);
+        t.total = u64(kernel) + u64(user);  // kernel time includes idle time
+    }
+#else
+    std::ifstream f("/proc/stat");
+    std::string cpu;
+    uint64_t v[10] = {};
+    f >> cpu;
+    for (int i = 0; i < 10 && (f >> v[i]); ++i) {}
+    for (uint64_t x : v) t.total += x;
+    t.idle = v[3] + v[4];  // idle + iowait
+#endif
+    return t;
+}
+
+double cpuBusyPercent(const CpuTimes& a, const CpuTimes& b) {
+    const double total = (double)(b.total - a.total), idle = (double)(b.idle - a.idle);
+    return total > 0 ? 100.0 * (1.0 - idle / total) : 0.0;
+}
+
 }  // namespace friday

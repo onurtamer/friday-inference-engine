@@ -73,6 +73,14 @@ recorded, docs updated, commit reviewed.
   - [ ] Linux build and tests (x86-64, WSL): needs a toolchain in WSL.
   - [ ] ARM64: NEON kernels, cross-compile, QEMU and real-device tests —
         deferred to the end of R3 (no ARM device yet; Raspberry Pi as interim).
+- **R5 — in progress.**
+  - [x] `friday-bench`: N runs + warmup, median/min/max decode, p50/p95 token
+        latency, background and in-run CPU load, free RAM, GPU clocks / temp /
+        power / utilization (NVML at run time), driver, git rev, JSON output.
+  - [x] `tools/bench/llama_cpp_bench.py`: llama-server on the same prompt ids.
+  - [x] `tools/bench/estimate.py`: bandwidth model calibrated on the RTX 3060 +
+        5600X (within ~3% there); estimate table in docs/BENCHMARKS.md.
+  - [ ] Measured table from a quiet-machine session (needs the dev box idle).
 - **R4 baseline (measured 2026-11-07, RTX 3060 12 GB, Qwen2.5-32B Q2_K):**
   FRIDAY 1.5–1.7 tok/s decode, 1.3–1.9 tok/s prefill (55/64 layers on GPU);
   llama.cpp b12189 8.3 tok/s decode, 73.5 tok/s prefill (50/64 layers on GPU).

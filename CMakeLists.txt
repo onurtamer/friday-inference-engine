@@ -54,6 +54,7 @@ set(FRIDAY_HOST_SOURCES
 # Pure C++ (compiled by the C++ compiler in every build).
 set(FRIDAY_CPU_SOURCES
     system_info.cpp
+    gpu_monitor.cpp
     model_layout.cpp
     cpu_backend.cpp
     gguf_file.cpp
@@ -100,6 +101,21 @@ if(FRIDAY_ENABLE_CUDA)
     set_target_properties(FridayEngine PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 target_link_libraries(FridayEngine PRIVATE friday_engine)
+
+# Benchmark tool (tools/bench). The git revision is recorded in its JSON output.
+find_package(Git QUIET)
+set(FRIDAY_GIT_REV "unknown")
+if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    OUTPUT_VARIABLE FRIDAY_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+set_source_files_properties(tools/bench/friday_bench.cpp PROPERTIES LANGUAGE ${FRIDAY_HOST_LANGUAGE})
+add_executable(friday-bench tools/bench/friday_bench.cpp)
+target_compile_definitions(friday-bench PRIVATE FRIDAY_GIT_REV="${FRIDAY_GIT_REV}")
+if(FRIDAY_ENABLE_CUDA)
+    set_target_properties(friday-bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+target_link_libraries(friday-bench PRIVATE friday_engine)
 
 if(FRIDAY_BUILD_TESTS)
     enable_testing()

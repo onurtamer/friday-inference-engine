@@ -26,6 +26,12 @@ struct MemoryInfo {
 CpuInfo cpuInfo();
 MemoryInfo memoryInfo();
 
+// System-wide CPU time counters; busy % between two snapshots measures the
+// load of everything running on the machine (including this process).
+struct CpuTimes { uint64_t idle = 0, total = 0; };
+CpuTimes cpuTimes();
+double cpuBusyPercent(const CpuTimes& a, const CpuTimes& b);
+
 }  // namespace friday
 
 #endif  // FRIDAY_SYSTEM_INFO_H
