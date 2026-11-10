@@ -25,7 +25,7 @@ void launchDecodeAttentionDevPos(const half* q, const half* k_cache, const half*
                                  int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
 bool decodeAttentionFitsSharedMemory(int max_seq_len);
 
-// Split-K (flash-decoding) variant: positions in chunks of 256, one block per
+// Split-K (flash-decoding) variant: positions in chunks of 64, one block per
 // (head, chunk), then a combine kernel. Sequence length = d_pos ? *d_pos + 1 :
 // seq_len. `workspace` must hold splitAttentionWorkspaceBytes(num_heads,
 // max_seq_len) bytes. No shared-memory limit on the context length.
