@@ -167,7 +167,11 @@ private:
     cudaStream_t graph_stream_ = nullptr;
     const half* graph_input_ = nullptr;
     void gpuLayerFused(int layer_idx, unsigned char* d_layer_buf, half* d_x, int pos, cudaStream_t stream);
-    std::unique_ptr<friday::CpuLayerRunner> cpu_runner_;  // layers num_gpu_resident_layers_ .. num_layers_ - 1
+    std::unique_ptr<friday::CpuLayerRunner> cpu_runner_;
+    // FRIDAY_PROFILE=1: per-token phase times (GPU layers incl. the wait, CPU
+    // layers, tail = hand-back + final norm + LM head), summarized at exit.
+    bool profile_ = false;
+    std::vector<float> prof_gpu_ms_, prof_cpu_ms_, prof_tail_ms_;  // layers num_gpu_resident_layers_ .. num_layers_ - 1
     half* h_act_pinned_ = nullptr;                         // hidden state staging for GPU <-> CPU hand-off
 
     // ============================================================

@@ -79,6 +79,14 @@ FRIDAY / llama.cpp `-ngl 58`, 3 runs each: 9.18 / 13.15, 12.20 / 13.26,
 12.16 / 13.25 tok/s. FRIDAY's split GPU+CPU runs vary between rounds (cause not
 identified yet; GPU clocks and CPU load were normal), llama.cpp's do not.
 
+Follow-up 2026-11-10 (after GQA split-K attention, 8217fa4; same session,
+512-token prompt): Llama 3.1 8B 57.6 vs 62.4 tok/s (92%), Qwen3 8B 55.7 vs 60.6
+(92%), Qwen2.5-32B 11.8 vs 13.6 (87%, llama.cpp `-ngl 58`). `FRIDAY_PROFILE=1`
+splits a Qwen2.5-32B token into GPU layers 42.7 ms (58 layers, ~250 GB/s), CPU
+layers 36.2 ms (6 layers, ~29 GB/s) and tail 2.0 ms. The run-to-run instability
+seen on 2026-11-09 did not reproduce in 6 processes on 2026-11-10 (12.4-12.7
+tok/s at short context), including runs started right after llama-server.
+
 Findings to act on: FRIDAY is ~10% slower than llama.cpp at a 512-640 token
 context on all three models and closer at short context (~2% on the 8B models
 in earlier same-session runs), which points at attention cost growing with

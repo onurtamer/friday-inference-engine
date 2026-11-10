@@ -9,6 +9,7 @@
 #include "cpu_threadpool.h"
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <stdexcept>
 #include "io_manager.h"
 #include "kernel_dispatcher.h"
@@ -287,6 +288,8 @@ Transformer::Transformer(
     {
         const char* e = std::getenv("FRIDAY_OFFLOAD");
         cpu_offload_ = !(e && std::strcmp(e, "stream") == 0);
+        const char* pr = std::getenv("FRIDAY_PROFILE");
+        profile_ = pr && pr[0] == '1';
     }
 
     // =========================================================================
@@ -579,6 +582,17 @@ Transformer::Transformer(
 
 // Destructor: GPU ve Host belleklerini temizler
 Transformer::~Transformer() {
+    if (profile_ && !prof_gpu_ms_.empty()) {
+        auto stats = [](std::vector<float> v, const char* name) {
+            std::sort(v.begin(), v.end());
+            auto at = [&](double p) { return v[(size_t)(p * (v.size() - 1))]; };
+            printf("[profile] %-5s per token: median %7.2f ms  p95 %7.2f ms  max %7.2f ms  (n=%zu)\n", name, at(0.5),
+                   at(0.95), v.back(), v.size());
+        };
+        stats(prof_gpu_ms_, "gpu");
+        stats(prof_cpu_ms_, "cpu");
+        stats(prof_tail_ms_, "tail");
+    }
     printf("[Transformer] Destructor cagrildi: GPU ve Host bellekleri serbest birakiliyor...\n");
     for (auto* ptr : d_gpu_resident_layers_) {
         if (ptr) CUDA_CHECK(cudaFree(ptr));
@@ -1048,6 +1062,9 @@ void Transformer::forward(
     cudaStream_t stream)
 {
     cudaStream_t compute_stream = (stream != nullptr) ? stream : stream_compute_;
+    using PClock = std::chrono::steady_clock;
+    const PClock::time_point prof_t0 = profile_ ? PClock::now() : PClock::time_point();
+    PClock::time_point prof_t1 = prof_t0, prof_t2 = prof_t0;
 
     // Gecici aktivasyon tamponlarini sifirla
     CUDA_CHECK(cudaMemsetAsync(d_query_out_, 0, hidden_dim_ * sizeof(half), compute_stream));
@@ -1167,12 +1184,14 @@ void Transformer::forward(
         CUDA_CHECK(cudaMemcpyAsync(h_act_pinned_, d_input_activations, hidden_dim_ * sizeof(half),
                                    cudaMemcpyDeviceToHost, compute_stream));
         CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        if (profile_) prof_t1 = PClock::now();
         float* x = cpu_runner_->hidden();
         const uint16_t* hb = reinterpret_cast<const uint16_t*>(h_act_pinned_);
         for (int i = 0; i < hidden_dim_; ++i) x[i] = friday_cpu::halfToFloat(hb[i]);
         cpu_runner_->run(pos_offset);
         uint16_t* ho = reinterpret_cast<uint16_t*>(h_act_pinned_);
         for (int i = 0; i < hidden_dim_; ++i) ho[i] = friday_cpu::floatToHalf(x[i]);
+        if (profile_) prof_t2 = PClock::now();
         CUDA_CHECK(cudaMemcpyAsync(d_input_activations, h_act_pinned_, hidden_dim_ * sizeof(half),
                                    cudaMemcpyHostToDevice, compute_stream));
     }
@@ -1315,4 +1334,14 @@ void Transformer::forward(
     }
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+    if (profile_) {
+        const PClock::time_point t3 = PClock::now();
+        if (prof_t1 == prof_t0) prof_t1 = prof_t2 = t3;  // no CPU layers: all GPU
+        auto ms = [](PClock::time_point a, PClock::time_point b) {
+            return std::chrono::duration<float, std::milli>(b - a).count();
+        };
+        prof_gpu_ms_.push_back(ms(prof_t0, prof_t1));
+        prof_cpu_ms_.push_back(ms(prof_t1, prof_t2));
+        prof_tail_ms_.push_back(ms(prof_t2, t3));
+    }
 }
