@@ -1,6 +1,7 @@
 #include "attention_kernels.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -486,6 +487,200 @@ void launchDecodeAttentionSplit(const half* q, const void* k_cache, const void* 
 
 bool decodeAttentionFitsSharedMemory(int max_seq_len) {
     return (size_t)(kHeadDim + kWarps + max_seq_len) * sizeof(float) <= 48 * 1024;
+}
+
+// ---------------------------------------------------------------------------
+// Causal prefill attention. Block = (kv head, tile of kPfTokens queries): rows
+// r = tq * G + g (token tq of the tile, query head kvh * G + g). Keys/values in
+// chunks of 32 positions are read once per tile into shared memory (fp32,
+// int8 dequantized as in the decode kernels). Scores: warp w takes rows
+// w, w + 8, ...; lane j takes position c0 + j, so the online softmax of a row
+// lives in one warp. P @ V: thread owns dims 2dp, 2dp + 1 of rows rs, rs + 4, ...
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kPfTokens = 8, kPfChunk = 32, kPfThreads = 256, kPfMaxRows = kPfTokens * kMaxGroup;
+constexpr int kPfKStride = kHeadDim + 1;   // conflict-free K reads across lanes
+
+size_t prefillAttnSmemBytes(int rows) {
+    return (size_t)rows * kHeadDim * sizeof(half)                 // q
+         + (size_t)kPfChunk * kPfKStride * sizeof(float)         // K
+         + (size_t)kPfChunk * kHeadDim * sizeof(float)           // V
+         + (size_t)rows * kPfChunk * sizeof(float)               // P
+         + (size_t)rows * 2 * sizeof(float);                     // alpha, l
+}
+
+template <bool Q8>
+__global__ __launch_bounds__(kPfThreads) void prefillAttentionKernel(
+    const half* __restrict__ q, const void* __restrict__ k_cache, const void* __restrict__ v_cache,
+    const half* __restrict__ k_scale, const half* __restrict__ v_scale, half* __restrict__ out, int T,
+    const int* __restrict__ d_pos0, int num_heads, int num_kv_heads) {
+    extern __shared__ __align__(16) unsigned char pf_smem[];
+    const int G = num_heads / num_kv_heads, R = kPfTokens * G;
+    half* s_q = reinterpret_cast<half*>(pf_smem);
+    float* s_k = reinterpret_cast<float*>(s_q + (size_t)R * kHeadDim);
+    float* s_v = s_k + kPfChunk * kPfKStride;
+    float* s_p = s_v + kPfChunk * kHeadDim;
+    float* s_alpha = s_p + R * kPfChunk;
+    float* s_l = s_alpha + R;
+
+    const int kvh = blockIdx.x, t0 = blockIdx.y * kPfTokens;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int qd = num_heads * kHeadDim, kv_dim = num_kv_heads * kHeadDim;
+    const int p0 = *d_pos0;
+    const int nt = min(kPfTokens, T - t0);
+    const int pmax = p0 + t0 + nt - 1;
+    const float scale = rsqrtf((float)kHeadDim);
+
+    for (int i = tid; i < R * kHeadDim; i += kPfThreads) {
+        const int r = i / kHeadDim, d = i % kHeadDim, tq = r / G, g = r % G;
+        s_q[i] = (tq < nt) ? q[(size_t)(t0 + tq) * qd + (kvh * G + g) * kHeadDim + d] : __float2half(0.0f);
+    }
+    // Row statistics, held by the warp that scores the row (same value in all lanes).
+    constexpr int kRowsPerWarp = kPfMaxRows / (kPfThreads / 32);
+    float m_row[kRowsPerWarp], l_row[kRowsPerWarp];
+    #pragma unroll
+    for (int i = 0; i < kRowsPerWarp; ++i) { m_row[i] = -1e30f; l_row[i] = 0.0f; }
+    // Output accumulators: rows rs + 4i, dims 2dp, 2dp + 1.
+    const int dp = tid & 63, rs = tid >> 6;
+    constexpr int kRowsPerThread = kPfMaxRows / 4;
+    float o0[kRowsPerThread], o1[kRowsPerThread];
+    #pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) { o0[i] = 0.0f; o1[i] = 0.0f; }
+
+    for (int c0 = 0; c0 <= pmax; c0 += kPfChunk) {
+        __syncthreads();   // previous chunk's K/V/P fully used (and s_q written)
+        for (int i = tid; i < kPfChunk * kHeadDim; i += kPfThreads) {
+            const int j = i / kHeadDim, d = i % kHeadDim, pos = c0 + j;
+            float kf = 0.0f, vf = 0.0f;
+            if (pos <= pmax) {
+                const size_t idx = (size_t)pos * kv_dim + kvh * kHeadDim + d;
+                if (Q8) {
+                    kf = (float)static_cast<const int8_t*>(k_cache)[idx] * __half2float(k_scale[idx / 32]);
+                    vf = (float)static_cast<const int8_t*>(v_cache)[idx] * __half2float(v_scale[idx / 32]);
+                } else {
+                    kf = __half2float(static_cast<const half*>(k_cache)[idx]);
+                    vf = __half2float(static_cast<const half*>(v_cache)[idx]);
+                }
+            }
+            s_k[j * kPfKStride + d] = kf;
+            s_v[j * kHeadDim + d] = vf;
+        }
+        __syncthreads();
+        // Scores + online softmax.
+        #pragma unroll
+        for (int i = 0; i < kRowsPerWarp; ++i) {
+            const int r = warp + 8 * i;
+            if (r >= R) break;
+            const int tq = r / G, pos = c0 + lane, prow = p0 + t0 + tq;
+            const bool valid = tq < nt && pos <= prow;
+            float sc = 0.0f;
+            const half2* qr = reinterpret_cast<const half2*>(s_q + r * kHeadDim);
+            const float* kr = s_k + lane * kPfKStride;
+            #pragma unroll 8
+            for (int d = 0; d < kHeadDim / 2; ++d) {
+                const float2 qf = __half22float2(qr[d]);
+                sc += qf.x * kr[2 * d] + qf.y * kr[2 * d + 1];
+            }
+            float score = sc * scale;
+            if (isnan(score)) score = -1e30f;
+            float cm = valid ? score : -1e30f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) cm = fmaxf(cm, __shfl_xor_sync(0xffffffffu, cm, off));
+            const float m_new = fmaxf(m_row[i], cm);
+            const float da = m_row[i] - m_new, dsc = score - m_new;
+            const float alpha = (da < -50.0f) ? 0.0f : expf(da);
+            const float p = (valid && dsc >= -50.0f) ? expf(dsc) : 0.0f;
+            float ps = p;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, off);
+            l_row[i] = l_row[i] * alpha + ps;
+            m_row[i] = m_new;
+            s_p[r * kPfChunk + lane] = p;
+            if (lane == 0) s_alpha[r] = alpha;
+        }
+        __syncthreads();
+        // O = O * alpha + P @ V
+        #pragma unroll
+        for (int i = 0; i < kRowsPerThread; ++i) {
+            const int r = rs + 4 * i;
+            if (r >= R) break;
+            const float a = s_alpha[r];
+            float acc0 = o0[i] * a, acc1 = o1[i] * a;
+            const float* pr = s_p + r * kPfChunk;
+            #pragma unroll 8
+            for (int j = 0; j < kPfChunk; ++j) {
+                const float w = pr[j];
+                const float2 v = *reinterpret_cast<const float2*>(s_v + j * kHeadDim + 2 * dp);
+                acc0 += w * v.x;
+                acc1 += w * v.y;
+            }
+            o0[i] = acc0;
+            o1[i] = acc1;
+        }
+    }
+    // Row sums to the output threads.
+    #pragma unroll
+    for (int i = 0; i < kRowsPerWarp; ++i) {
+        const int r = warp + 8 * i;
+        if (r < R && lane == 0) s_l[r] = l_row[i];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < kRowsPerThread; ++i) {
+        const int r = rs + 4 * i;
+        if (r >= R) break;
+        const int tq = r / G, g = r % G;
+        if (tq >= nt) continue;
+        const float L = s_l[r];
+        float r0 = (L > 1e-12f) ? o0[i] / L : 0.0f, r1 = (L > 1e-12f) ? o1[i] / L : 0.0f;
+        if (isnan(r0)) r0 = 0.0f;
+        if (isnan(r1)) r1 = 0.0f;
+        r0 = fminf(fmaxf(r0, -65504.0f), 65504.0f);
+        r1 = fminf(fmaxf(r1, -65504.0f), 65504.0f);
+        half* o = out + (size_t)(t0 + tq) * qd + (kvh * G + g) * kHeadDim + 2 * dp;
+        o[0] = __float2half(r0);
+        o[1] = __float2half(r1);
+    }
+}
+
+}  // namespace
+
+bool prefillAttentionSupported(int num_heads, int num_kv_heads, int head_dim) {
+    return head_dim == kHeadDim && num_kv_heads > 0 && num_heads % num_kv_heads == 0 &&
+           num_heads / num_kv_heads <= kMaxGroup;
+}
+
+void launchPrefillAttention(const half* q, const void* k_cache, const void* v_cache, half* out, int T,
+                            const int* d_pos0, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream,
+                            const half* k_scale, const half* v_scale) {
+    if (T <= 0) return;
+    if (!prefillAttentionSupported(num_heads, num_kv_heads, head_dim)) {
+        std::fprintf(stderr, "launchPrefillAttention: unsupported head layout\n");
+        std::abort();
+    }
+    const int rows = kPfTokens * (num_heads / num_kv_heads);
+    const size_t smem = prefillAttnSmemBytes(rows);
+    const dim3 grid(num_kv_heads, (T + kPfTokens - 1) / kPfTokens);
+    if (k_scale && v_scale) {
+        static bool attr = false;
+        if (!attr) {
+            cudaFuncSetAttribute(prefillAttentionKernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)prefillAttnSmemBytes(kPfMaxRows));
+            attr = true;
+        }
+        prefillAttentionKernel<true><<<grid, kPfThreads, smem, stream>>>(q, k_cache, v_cache, k_scale, v_scale, out, T,
+                                                                       d_pos0, num_heads, num_kv_heads);
+    } else {
+        static bool attr = false;
+        if (!attr) {
+            cudaFuncSetAttribute(prefillAttentionKernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)prefillAttnSmemBytes(kPfMaxRows));
+            attr = true;
+        }
+        prefillAttentionKernel<false><<<grid, kPfThreads, smem, stream>>>(q, k_cache, v_cache, nullptr, nullptr, out,
+                                                                        T, d_pos0, num_heads, num_kv_heads);
+    }
 }
 
 }  // namespace friday_attn

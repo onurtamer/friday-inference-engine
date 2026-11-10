@@ -35,6 +35,9 @@ if(FRIDAY_ENABLE_CUDA)
     friday_test_target(test_prefill_gemm kernels/test_prefill_gemm.cu)
     add_test(NAME prefill_gemm COMMAND test_prefill_gemm)
     set_tests_properties(prefill_gemm PROPERTIES LABELS "gpu")
+    friday_test_target(test_prefill_attention kernels/test_prefill_attention.cu)
+    add_test(NAME prefill_attention COMMAND test_prefill_attention)
+    set_tests_properties(prefill_attention PROPERTIES LABELS "gpu")
 endif()
 
 find_package(Python3 COMPONENTS Interpreter)
@@ -81,6 +84,9 @@ endif()
 set(FRIDAY_MODEL_DIR "" CACHE PATH
     "Directory with friday_aligned_int4.bin, tensor_map.json, tokenizer_config.json (enables model tests)")
 friday_test_target(golden_check model/golden_check.cpp)
+if(FRIDAY_ENABLE_CUDA)
+    friday_test_target(test_prefill_engine model/test_prefill_engine.cpp)
+endif()
 friday_test_target(test_tokenizer_qwen model/test_tokenizer_qwen.cpp)
 # Qwen2.5-32B needs ~13 GB of host RAM when run fully on the CPU; in CPU-only
 # builds its tests are opt-in.
@@ -103,6 +109,9 @@ if(FRIDAY_MODEL_DIR AND (FRIDAY_ENABLE_CUDA OR FRIDAY_BIG_CPU_TESTS))
                      COMMAND golden_check ${_gguf} - ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen25-32b-q2k - 12.0)
             set_tests_properties(model_regression_qwen25_32b_q2k_prefill PROPERTIES LABELS "model" TIMEOUT 600
                                  ENVIRONMENT "FRIDAY_GOLDEN_PREFILL=1")
+            # prefill vs step: 600 tokens (two chunks) and a prefill at pos > 0 (CPU-layer KV upload)
+            add_test(NAME prefill_engine_qwen25_32b_q2k COMMAND test_prefill_engine ${_gguf} 12.0 600 0.15)
+            set_tests_properties(prefill_engine_qwen25_32b_q2k PROPERTIES LABELS "model" TIMEOUT 900)
         endif()
     endif()
     # Deprecated converter output (.bin + tensor_map.json + tokenizer_config.json), if present.
@@ -164,5 +173,10 @@ if(FRIDAY_LLAMA31_GGUF AND EXISTS ${FRIDAY_LLAMA31_GGUF})
                  COMMAND golden_check ${FRIDAY_LLAMA31_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/llama31-8b-q4km - 3.0)
         set_tests_properties(model_regression_llama31_8b_q4km_prefill model_regression_llama31_8b_q4km_prefill_split
                              PROPERTIES LABELS "model" TIMEOUT 600 ENVIRONMENT "FRIDAY_GOLDEN_PREFILL=1")
+        add_test(NAME prefill_engine_llama31_8b_q4km COMMAND test_prefill_engine ${FRIDAY_LLAMA31_GGUF} 12.0 600 0.1)
+        add_test(NAME prefill_engine_llama31_8b_q4km_split
+                 COMMAND test_prefill_engine ${FRIDAY_LLAMA31_GGUF} 3.0 600 0.1)
+        set_tests_properties(prefill_engine_llama31_8b_q4km prefill_engine_llama31_8b_q4km_split
+                             PROPERTIES LABELS "model" TIMEOUT 900)
     endif()
 endif()

@@ -224,8 +224,22 @@ private:
     };
     bool allocPrefillScratch(PrefillScratch& ps, int cap);
     void freePrefillScratch(PrefillScratch& ps);
-    void prefillLayerFused(int layer_idx, unsigned char* buf, PrefillScratch& ps, int T, cudaStream_t s);
+    // k_layer/v_layer non-null: this layer's KV cache is that fp16 buffer ([max_ctx][kv_dim],
+    // used for CPU layers run on the GPU) instead of the GPU KV cache.
+    void prefillLayerFused(int layer_idx, unsigned char* buf, PrefillScratch& ps, int T, cudaStream_t s,
+                           half* k_layer = nullptr, half* v_layer = nullptr);
+    // CPU layers of a split model through the prefill staging buffers; false if the
+    // GPU memory for it is not available (the caller then runs them token by token).
+    bool prefillCpuLayersOnGpu(PrefillScratch& ps, int T, int p0, int pos0, int n, bool first_chunk,
+                               bool last_chunk, cudaStream_t s);
+    half* d_pf_cpu_kv_ = nullptr;   // fp16 KV of the CPU layers during a prefill
+    cudaEvent_t pf_stage_free_[kPrefillStageCount] = {}, pf_stage_ready_[kPrefillStageCount] = {};
     void finalHead(half* d_x, half* d_output_logits, cudaStream_t s);
+    // FRIDAY_PROFILE=1: GPU time of prefill segments (CUDA events), printed per prefill() call.
+    enum PrefillSeg { kSegGemm, kSegAttn, kSegOther, kSegCpu, kSegCount };
+    std::vector<std::pair<cudaEvent_t, int>> pf_marks_;
+    void pfMark(int seg, cudaStream_t s);
+    void pfReport(int n);
     unsigned char* d_prefill_stage_[kPrefillStageCount] = {nullptr, nullptr};
 
     // Ping-Pong Asenkron Akışları

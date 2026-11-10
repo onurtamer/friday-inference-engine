@@ -131,21 +131,29 @@ int main(int argc, char** argv) {
             std::vector<half> ref((size_t)T * N), got((size_t)T * N);
             CUDA_OK(cudaMemcpy(ref.data(), d_ref, ref.size() * 2, cudaMemcpyDeviceToHost));
             CUDA_OK(cudaMemcpy(got.data(), d_y, got.size() * 2, cudaMemcpyDeviceToHost));
-            double num = 0, den = 0, max_rel = 0;
+            // max_rel: largest |difference| relative to the RMS of the reference. A
+            // different summation order can move one fp16 rounding step of an
+            // intermediate (before bias/residual), which a per-element relative
+            // error would flag when the residual cancels it; a layout bug gives
+            // differences of the order of the RMS.
+            double num = 0, den = 0, max_abs = 0;
             int nonfinite = 0, exact = 0;
+            double worst_r = 0, worst_g = 0;
             for (size_t i = 0; i < ref.size(); ++i) {
                 const double r = __half2float(ref[i]), g = __half2float(got[i]);
                 if (!std::isfinite(g)) { ++nonfinite; continue; }
                 num += (g - r) * (g - r);
                 den += r * r;
                 if (g == r) ++exact;
-                max_rel = std::fmax(max_rel, std::fabs(g - r) / (std::fabs(r) + 1e-2));
+                if (std::fabs(g - r) > max_abs) { max_abs = std::fabs(g - r); worst_r = r; worst_g = g; }
             }
             const double rel = std::sqrt(num / (den > 0 ? den : 1e-300));
+            const double max_rel = max_abs / std::sqrt(den / ref.size() + 1e-30);
             const bool ok = nonfinite == 0 && rel < 1e-3 && max_rel < 1e-2;
             std::printf("%-5s T=%-4d K=%-5d N=%-4d %s rel_l2=%.2e max_rel=%.2e exact=%.1f%% %s\n", L.name, T, K, N,
                         S.epi ? "bias+res" : "plain   ", rel, max_rel, 100.0 * exact / ref.size(),
                         ok ? "PASS" : "FAIL");
+            if (!ok) std::printf("      worst element: ref %.6g got %.6g\n", worst_r, worst_g);
             CHECK(ok);
             cudaFree(d_w); cudaFree(d_x); cudaFree(d_ref); cudaFree(d_y); cudaFree(d_res);
             cudaFree(d_bias); cudaFree(d_xq); cudaFree(d_xd);

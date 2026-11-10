@@ -1159,7 +1159,31 @@ void Transformer::freePrefillScratch(PrefillScratch& ps) {
 // gpuLayerFused for T tokens at positions *d_pos_ .. *d_pos_ + T - 1 (rows of ps).
 // Attention runs once per token with the decode kernel, so each query sees
 // exactly the keys it would see in decode.
-void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillScratch& ps, int T, cudaStream_t s) {
+void Transformer::pfMark(int seg, cudaStream_t s) {
+    if (!profile_) return;
+    cudaEvent_t e;
+    CUDA_CHECK(cudaEventCreate(&e));
+    CUDA_CHECK(cudaEventRecord(e, s));
+    pf_marks_.push_back({e, seg});
+}
+
+void Transformer::pfReport(int n) {
+    if (pf_marks_.size() < 2) return;
+    CUDA_CHECK(cudaEventSynchronize(pf_marks_.back().first));
+    float ms[kSegCount] = {};
+    for (size_t i = 0; i + 1 < pf_marks_.size(); ++i) {
+        float t = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&t, pf_marks_[i].first, pf_marks_[i + 1].first));
+        ms[pf_marks_[i].second] += t;
+    }
+    for (auto& m : pf_marks_) cudaEventDestroy(m.first);
+    pf_marks_.clear();
+    printf("[profile] prefill %d tokens: GEMM %.1f ms | attention %.1f ms | other %.1f ms | CPU layers %.1f ms\n",
+           n, ms[kSegGemm], ms[kSegAttn], ms[kSegOther], ms[kSegCpu]);
+}
+
+void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillScratch& ps, int T, cudaStream_t s,
+                                    half* k_over, half* v_over) {
     const auto& li = layers_info_[layer_idx];
     const std::string pre = "blk." + std::to_string(layer_idx) + ".";
     auto ptr = [&](const char* n) -> unsigned char* {
@@ -1174,11 +1198,14 @@ void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillSc
     };
     const int H = hidden_dim_, kv_dim = num_kv_heads_ * head_dim_, QD = num_heads_ * head_dim_;
 
+    pfMark(kSegOther, s);
     friday_hpc::rmsNormQuantQ8Rows(ps.x, (const float*)ptr("attn_norm.weight"), T, H, rms_norm_epsilon_, ps.xq, ps.xd,
                                    s);
+    pfMark(kSegGemm, s);
     gemm("attn_q.weight", H, ps.q, QD, (const float*)ptr("attn_q.bias"), nullptr);
     gemm("attn_k.weight", H, ps.k, kv_dim, (const float*)ptr("attn_k.bias"), nullptr);
     gemm("attn_v.weight", H, ps.v, kv_dim, (const float*)ptr("attn_v.bias"), nullptr);
+    pfMark(kSegOther, s);
     if (ptr("attn_q_norm.weight") && ptr("attn_k_norm.weight")) {
         headRmsNormKernel<<<num_heads_ * T, head_dim_, head_dim_ * sizeof(float), s>>>(
             ps.q, (const float*)ptr("attn_q_norm.weight"), head_dim_, rms_norm_epsilon_);
@@ -1187,7 +1214,15 @@ void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillSc
     }
     const size_t layer_elems = (size_t)layer_idx * max_ctx_ * kv_dim;
     const dim3 rope_grid((head_dim_ / 2 + 255) / 256, T);
-    if (kv_q8_) {
+    // Causal attention for the whole batch (FRIDAY_PREFILL_ATTN=token: one decode
+    // kernel launch per token, the previous behaviour).
+    static const bool pf_attn_env_token = [] {
+        const char* e = std::getenv("FRIDAY_PREFILL_ATTN");
+        return e && std::strcmp(e, "token") == 0;
+    }();
+    const bool pf_attn_batched =
+        !pf_attn_env_token && friday_attn::prefillAttentionSupported(num_heads_, num_kv_heads_, head_dim_);
+    if (kv_q8_ && !k_over) {
         int8_t* kq = reinterpret_cast<int8_t*>(d_k_cache_) + layer_elems;
         int8_t* vq = reinterpret_cast<int8_t*>(d_v_cache_) + layer_elems;
         half* ks = d_k_scale_ + layer_elems / 32;
@@ -1197,15 +1232,25 @@ void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillSc
         const int warps = 8, nblk = 2 * kv_dim / 32;
         storeKvQ8Kernel<<<dim3((nblk + warps - 1) / warps, T), warps * 32, 0, s>>>(ps.k, ps.v, kq, ks, vq, vs, d_pos_,
                                                                                   kv_dim);
-        for (int t = 0; t < T; ++t)
-            friday_attn::launchDecodeAttentionSplit(ps.q + (size_t)t * QD, kq, vq, ps.ctx + (size_t)t * QD, 0,
-                                                    ps.positions + t, max_ctx_, num_heads_, num_kv_heads_, head_dim_,
-                                                    d_attn_ws_, s, ks, vs);
+        pfMark(kSegAttn, s);
+        if (pf_attn_batched)
+            friday_attn::launchPrefillAttention(ps.q, kq, vq, ps.ctx, T, d_pos_, num_heads_, num_kv_heads_, head_dim_,
+                                                s, ks, vs);
+        else
+            for (int t = 0; t < T; ++t)
+                friday_attn::launchDecodeAttentionSplit(ps.q + (size_t)t * QD, kq, vq, ps.ctx + (size_t)t * QD, 0,
+                                                        ps.positions + t, max_ctx_, num_heads_, num_kv_heads_,
+                                                        head_dim_, d_attn_ws_, s, ks, vs);
     } else {
-        half* k_layer = d_k_cache_ + layer_elems;
-        half* v_layer = d_v_cache_ + layer_elems;
+        half* k_layer = k_over ? k_over : d_k_cache_ + layer_elems;
+        half* v_layer = v_over ? v_over : d_v_cache_ + layer_elems;
         ropeStoreKvKernel<<<rope_grid, 256, 0, s>>>(ps.q, ps.k, ps.v, k_layer, v_layer, d_pos_, head_dim_, num_heads_,
                                                     num_kv_heads_, rope_freq_base_, rope_neox_ ? 1 : 0, d_rope_freqs_);
+        pfMark(kSegAttn, s);
+        if (pf_attn_batched)
+            friday_attn::launchPrefillAttention(ps.q, k_layer, v_layer, ps.ctx, T, d_pos_, num_heads_, num_kv_heads_,
+                                                head_dim_, s);
+        else
         for (int t = 0; t < T; ++t) {
             if (attn_split_)
                 friday_attn::launchDecodeAttentionSplit(ps.q + (size_t)t * QD, k_layer, v_layer, ps.ctx + (size_t)t * QD,
@@ -1217,17 +1262,100 @@ void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillSc
                                                          num_heads_, num_kv_heads_, head_dim_, s);
         }
     }
+    pfMark(kSegOther, s);
     friday_hpc::quantizeQ8Rows(ps.ctx, T, QD, ps.xq, ps.xd, s);
+    pfMark(kSegGemm, s);
     gemm("attn_output.weight", QD, ps.x, H, nullptr, ps.x);
 
+    pfMark(kSegOther, s);
     friday_hpc::rmsNormQuantQ8Rows(ps.x, (const float*)ptr("ffn_norm.weight"), T, H, rms_norm_epsilon_, ps.xq, ps.xd,
                                    s);
     const int I = (int)info("ffn_gate.weight").shape[1];
+    pfMark(kSegGemm, s);
     gemm("ffn_gate.weight", H, ps.gate, I, nullptr, nullptr);
     gemm("ffn_up.weight", H, ps.up, I, nullptr, nullptr);
+    pfMark(kSegOther, s);
     friday_hpc::siluMulQuantQ8Rows(ps.gate, ps.up, T, I, ps.xq, ps.xd, s);
+    pfMark(kSegGemm, s);
     gemm("ffn_down.weight", I, ps.x, H, nullptr, ps.x);
+    pfMark(kSegOther, s);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// CPU layers [num_gpu_resident_layers_, num_layers_) for one prefill chunk on the GPU.
+// Weights are copied from the CPU runner's host copy into the two staging buffers
+// (copy of layer i + 1 overlaps the compute of layer i); the KV cache of these
+// layers is an fp16 copy of the CPU runner's cache (its values are fp16-rounded,
+// so the copy is exact), uploaded on the first chunk for positions < pos0 and
+// written back for the new positions on the last chunk.
+bool Transformer::prefillCpuLayersOnGpu(PrefillScratch& ps, int T, int p0, int pos0, int n, bool first_chunk,
+                                        bool last_chunk, cudaStream_t s) {
+    const int first = num_gpu_resident_layers_, ncpu = num_layers_ - first;
+    const size_t kv_dim = (size_t)num_kv_heads_ * head_dim_, layer_kv = (size_t)max_ctx_ * kv_dim;
+    if (first_chunk) {
+        bool ok = true;
+        for (auto& p : d_prefill_stage_) ok = ok && cudaMalloc((void**)&p, layer_buffer_size_) == cudaSuccess;
+        ok = ok && cudaMalloc((void**)&d_pf_cpu_kv_, 2 * ncpu * layer_kv * sizeof(half)) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            for (auto& p : d_prefill_stage_) { if (p) cudaFree(p); p = nullptr; }
+            if (d_pf_cpu_kv_) cudaFree(d_pf_cpu_kv_);
+            d_pf_cpu_kv_ = nullptr;
+            return false;
+        }
+        for (int i = 0; i < kPrefillStageCount; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&pf_stage_free_[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&pf_stage_ready_[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(pf_stage_free_[i], s));
+        }
+        if (pos0 > 0) {   // earlier positions: CPU cache -> fp16 copy on the GPU
+            std::vector<uint16_t> h((size_t)pos0 * kv_dim);
+            for (int i = 0; i < ncpu; ++i)
+                for (int kv = 0; kv < 2; ++kv) {
+                    const float* src = kv ? cpu_runner_->vCache(i) : cpu_runner_->kCache(i);
+                    for (size_t e = 0; e < h.size(); ++e) h[e] = friday_cpu::floatToHalf(src[e]);
+                    CUDA_CHECK(cudaMemcpy(d_pf_cpu_kv_ + (2 * i + kv) * layer_kv, h.data(), h.size() * 2,
+                                          cudaMemcpyHostToDevice));
+                }
+        }
+    }
+    // Ping-pong over the two staging buffers.
+    auto enqueueCopy = [&](int i) {
+        const int slot = i % kPrefillStageCount;
+        CUDA_CHECK(cudaStreamWaitEvent(stream_io_, pf_stage_free_[slot], 0));
+        CUDA_CHECK(cudaMemcpyAsync(d_prefill_stage_[slot], cpu_runner_->layerWeights(i), cpu_runner_->layerBytes(i),
+                                   cudaMemcpyHostToDevice, stream_io_));
+        CUDA_CHECK(cudaEventRecord(pf_stage_ready_[slot], stream_io_));
+    };
+    enqueueCopy(0);
+    for (int i = 0; i < ncpu; ++i) {
+        if (i + 1 < ncpu) enqueueCopy(i + 1);
+        const int slot = i % kPrefillStageCount;
+        CUDA_CHECK(cudaStreamWaitEvent(s, pf_stage_ready_[slot], 0));
+        half* kl = d_pf_cpu_kv_ + (2 * i) * layer_kv;
+        prefillLayerFused(first + i, d_prefill_stage_[slot], ps, T, s, kl, kl + layer_kv);
+        CUDA_CHECK(cudaEventRecord(pf_stage_free_[slot], s));
+    }
+    (void)p0;
+    if (last_chunk) {   // new positions: fp16 copy -> CPU cache
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        std::vector<uint16_t> h((size_t)n * kv_dim);
+        for (int i = 0; i < ncpu; ++i)
+            for (int kv = 0; kv < 2; ++kv) {
+                CUDA_CHECK(cudaMemcpy(h.data(), d_pf_cpu_kv_ + (2 * i + kv) * layer_kv + (size_t)pos0 * kv_dim,
+                                      h.size() * 2, cudaMemcpyDeviceToHost));
+                float* dst = (kv ? cpu_runner_->vCache(i) : cpu_runner_->kCache(i)) + (size_t)pos0 * kv_dim;
+                for (size_t e = 0; e < h.size(); ++e) dst[e] = friday_cpu::halfToFloat(h[e]);
+            }
+        for (auto& p : d_prefill_stage_) { cudaFree(p); p = nullptr; }
+        cudaFree(d_pf_cpu_kv_);
+        d_pf_cpu_kv_ = nullptr;
+        for (int i = 0; i < kPrefillStageCount; ++i) {
+            cudaEventDestroy(pf_stage_free_[i]);
+            cudaEventDestroy(pf_stage_ready_[i]);
+        }
+    }
+    return true;
 }
 
 void Transformer::prefill(const int* tokens, int n, int pos0, half* d_x_last, half* d_output_logits, int vocab_size,
@@ -1243,6 +1371,8 @@ void Transformer::prefill(const int* tokens, int n, int pos0, half* d_x_last, ha
         if (cap <= 16) throw std::runtime_error("prefill: not enough GPU memory for the batch buffers");
         cap /= 2;
     }
+    bool cpu_on_gpu_failed = !prefill_stage_reserved_;
+    if (const char* e = std::getenv("FRIDAY_PREFILL_CPU"); e && std::strcmp(e, "token") == 0) cpu_on_gpu_failed = true;
     for (int c0 = 0; c0 < n; c0 += cap) {
         const int T = std::min(cap, n - c0), p0 = pos0 + c0;
         CUDA_CHECK(cudaStreamSynchronize(s));  // pinned h_pos_ / h_positions are free again
@@ -1255,8 +1385,13 @@ void Transformer::prefill(const int* tokens, int n, int pos0, half* d_x_last, ha
         CUDA_CHECK(cudaMemcpyAsync(d_pos_, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(ps.positions, ps.h_positions, T * sizeof(int), cudaMemcpyHostToDevice, s));
         for (int l = 0; l < num_gpu_resident_layers_; ++l) prefillLayerFused(l, d_gpu_resident_layers_[l], ps, T, s);
-        // CPU layers: token by token, as in decode.
-        if (cpu_offload_ && num_gpu_resident_layers_ < num_layers_) {
+        // CPU layers: on the GPU through the staging buffers, else token by token as in decode.
+        if (cpu_offload_ && num_gpu_resident_layers_ < num_layers_ && !cpu_on_gpu_failed) {
+            pfMark(kSegCpu, s);
+            if (!prefillCpuLayersOnGpu(ps, T, p0, pos0, n, c0 == 0, c0 + T == n, s)) cpu_on_gpu_failed = true;
+        }
+        if (cpu_offload_ && num_gpu_resident_layers_ < num_layers_ && cpu_on_gpu_failed) {
+            pfMark(kSegCpu, s);
             for (int t = 0; t < T; ++t) {
                 half* row = ps.x + (size_t)t * H;
                 CUDA_CHECK(cudaMemcpyAsync(h_act_pinned_, row, H * sizeof(half), cudaMemcpyDeviceToHost, s));
@@ -1275,8 +1410,11 @@ void Transformer::prefill(const int* tokens, int n, int pos0, half* d_x_last, ha
             CUDA_CHECK(cudaMemcpyAsync(d_x_last, ps.x + (size_t)(T - 1) * H, H * sizeof(half),
                                        cudaMemcpyDeviceToDevice, s));
     }
+    pfMark(kSegOther, s);
     finalHead(d_x_last, d_output_logits, s);
+    pfMark(kSegOther, s);
     CUDA_CHECK(cudaStreamSynchronize(s));
+    pfReport(n);
     freePrefillScratch(ps);
 }
 

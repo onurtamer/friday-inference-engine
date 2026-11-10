@@ -37,6 +37,18 @@ void launchDecodeAttentionSplit(const half* q, const void* k_cache, const void* 
                                 void* workspace, cudaStream_t stream, const half* k_scale = nullptr,
                                 const half* v_scale = nullptr);
 
+// Causal attention for T consecutive queries (prefill): query t is at position
+// *d_pos0 + t and attends to positions 0 .. *d_pos0 + t of the cache (which
+// already holds the T new keys/values). q and out are [T][num_heads * head_dim].
+// Same per-score rules as the decode kernels (NaN score -> -1e30, exp cut off
+// below -50 relative to the running max, output clamped, NaN -> 0); only the
+// order of the fp32 additions differs. One block per (kv head, 8 queries).
+// Needs head_dim == 128 and num_heads / num_kv_heads <= 8.
+bool prefillAttentionSupported(int num_heads, int num_kv_heads, int head_dim);
+void launchPrefillAttention(const half* q, const void* k_cache, const void* v_cache, half* out, int T,
+                            const int* d_pos0, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream,
+                            const half* k_scale = nullptr, const half* v_scale = nullptr);
+
 }  // namespace friday_attn
 
 #endif  // FRIDAY_ATTENTION_KERNELS_H

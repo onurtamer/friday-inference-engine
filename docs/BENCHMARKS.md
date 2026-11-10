@@ -51,9 +51,12 @@ were identical across runs.
 - llama.cpp: `timings.predicted_per_second` reported by llama-server.
 - Prefill: `Engine::prefill` (int8 tensor-core GEMM, compute capability 8.0+;
   otherwise one step per token). The tables below up to 2026-11-10 were measured
-  one token at a time. First batched version (2026-11-10, Llama 3.1 8B, 512
-  tokens, 3 runs): 465 tok/s vs 51 before; llama.cpp 1944. Attention still runs
-  once per token and CPU layers of a split model still run token by token.
+  one token at a time. 2026-11-10, 512-token prompt, 3 runs, same session as
+  llama.cpp b12189: Llama 3.1 8B 1057 tok/s (llama.cpp 1937, `-ngl 99`; decode in
+  the same session 51.9 vs 55.6); one step per token it was 51. Qwen2.5-32B
+  (56/8 split, CPU layers streamed through the GPU for the prefill): 197 tok/s
+  vs 18 one step per token (llama.cpp not re-measured in this session; 325 at
+  `-ngl 58` on 2026-11-09).
 
 ## Measured results
 

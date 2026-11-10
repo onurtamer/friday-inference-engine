@@ -41,6 +41,13 @@ public:
     int firstLayer() const { return first_; }
     int lastLayer() const { return last_; }
     size_t weightBytes() const { return weight_bytes_; }
+    // Packed weights of layer first + i (host RAM, same layout as ModelLayout::readLayer)
+    // and its KV cache ([max_ctx][kv_dim] floats each, fp16-rounded values), e.g. for
+    // a batched prefill of these layers on the GPU.
+    const unsigned char* layerWeights(int i) const { return weights_[i].get(); }
+    size_t layerBytes(int i) const { return layout_.layers[first_ + i].size_bytes; }
+    float* kCache(int i) { return k_cache_.data() + (size_t)i * p_.max_ctx * p_.num_kv_heads * p_.head_dim; }
+    float* vCache(int i) { return v_cache_.data() + (size_t)i * p_.max_ctx * p_.num_kv_heads * p_.head_dim; }
     int threads() const;
 
     // Hidden state (hidden_dim floats, fp16-rounded values) read and written by run().
