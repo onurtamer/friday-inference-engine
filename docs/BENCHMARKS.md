@@ -92,6 +92,17 @@ context on all three models and closer at short context (~2% on the 8B models
 in earlier same-session runs), which points at attention cost growing with
 context; split GPU+CPU runs are not stable; prefill needs batching (R4b).
 
+Split-run instability, 2026-11-10 (Qwen2.5-32B golden run, `FRIDAY_PROFILE=1`):
+the slow runs are slow in the GPU phase (48-112 ms per token instead of ~45 ms)
+and happen when VRAM is nearly full, whether the last ~340 MiB hold weights or
+allocated but untouched buffers: 9 of 17 runs slow with VRAM full, 0 of 17 with
+~340 MiB left free (same 56 GPU layers; cause inside the driver not verified).
+The planner now keeps room for two layer-sized prefill staging buffers when a
+model is split, which are allocated only while a batched prefill runs. On this
+model the default split moves from 58/6 to 56/8: CPU phase ~35 -> ~49 ms, but
+6 of 6 runs stable at ~9.8 tok/s (golden harness) instead of 6.3-10.5.
+`FRIDAY_PREFILL_STAGE=0` restores the old split.
+
 ## Estimates
 
 `estimate.py` predicts single-stream decode from memory traffic:

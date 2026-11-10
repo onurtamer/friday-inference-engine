@@ -400,11 +400,16 @@ Transformer::Transformer(
     const size_t kv_bytes_f16 = 2ULL * kv_elem * sizeof(half);
     const size_t kv_bytes_q8 = 2ULL * (kv_elem + kv_elem / 32 * sizeof(half));
     const size_t dma_reservation = cpu_offload_ ? 0 : (size_t)kDmaSlotCount * layer_buffer_size_;
-    auto overheadFor = [&](size_t kv_layer) {
-        return kMinGpuReserveBytes + dma_reservation + (cpu_offload_ ? 0 : (size_t)num_layers_ * kv_layer);
+    // Prefill staging buffers are charged only when the model does not fit (stage = true).
+    const size_t stage_bytes = (size_t)kPrefillStageCount * layer_buffer_size_;
+    bool stage_enabled = cpu_offload_;
+    if (const char* ps = std::getenv("FRIDAY_PREFILL_STAGE")) stage_enabled = stage_enabled && ps[0] != '0';
+    auto overheadFor = [&](size_t kv_layer, bool stage) {
+        return kMinGpuReserveBytes + dma_reservation + (cpu_offload_ ? 0 : (size_t)num_layers_ * kv_layer) +
+               (stage ? stage_bytes : 0);
     };
-    auto residentFor = [&](size_t kv_layer) {
-        const size_t ov = overheadFor(kv_layer);
+    auto residentForStage = [&](size_t kv_layer, bool stage) {
+        const size_t ov = overheadFor(kv_layer, stage);
         if (budget < ov) return -1;
         size_t avail = budget - ov;
         int n = 0;
@@ -415,6 +420,12 @@ Transformer::Transformer(
             ++n;
         }
         return n;
+    };
+    // Layers on the GPU: without staging if everything fits, otherwise with it.
+    auto residentFor = [&](size_t kv_layer) {
+        const int all = residentForStage(kv_layer, false);
+        if (all >= num_layers_ || !stage_enabled) return all;
+        return residentForStage(kv_layer, true);
     };
 
     // KV format: f16 / q8 as requested; auto = f16 if every layer fits on the GPU
@@ -440,7 +451,8 @@ Transformer::Transformer(
         kv_reason = kv_q8_ ? "auto: int8 fits more layers on the GPU" : "auto: int8 would not fit more layers";
     }
     const size_t kv_layer_bytes = kv_q8_ ? kv_bytes_q8 : kv_bytes_f16;
-    const size_t required_overhead = overheadFor(kv_layer_bytes);
+    const bool use_stage = stage_enabled && residentForStage(kv_layer_bytes, false) < num_layers_;
+    const size_t required_overhead = overheadFor(kv_layer_bytes, use_stage);
     printf("[Transformer] KV cache format: %s (%s)\n", kv_q8_ ? "int8" : "fp16", kv_reason);
 
     if (budget < required_overhead) {
@@ -459,8 +471,9 @@ Transformer::Transformer(
     printf("  VRAM total: %.2f GB | free before layers: %.2f GB",
            (double)total_bytes / (1u << 30), (double)free_bytes_before_residency / (1u << 30));
     if (vram_limit_gb_ > 0.1) printf(" | --vram cap: %.2f GB", vram_limit_gb_);
-    printf("\n  Reserved: %zu MiB safety + %zu MiB DMA (%d slots)\n",
-           kMinGpuReserveBytes >> 20, dma_reservation >> 20, cpu_offload_ ? 0 : kDmaSlotCount);
+    printf("\n  Reserved: %zu MiB safety + %zu MiB DMA (%d slots) + %zu MiB prefill staging\n",
+           kMinGpuReserveBytes >> 20, dma_reservation >> 20, cpu_offload_ ? 0 : kDmaSlotCount,
+           use_stage ? stage_bytes >> 20 : (size_t)0);
     printf("  GPU-resident layers: %d / %d (%.2f GB) | %s: %d\n",
            num_gpu_resident_layers_, num_layers_, (double)resident_weight_bytes / (1u << 30),
            cpu_offload_ ? "CPU-computed" : "host-streamed", num_streamed);
@@ -516,6 +529,10 @@ Transformer::Transformer(
     if (num_gpu_resident_layers_ > 0) {
         printf("[Transformer] %d adet katman GPU VRAM'e kalici yuklendi (Sifir transfer gecikmesi).\n", num_gpu_resident_layers_);
     }
+    // The staging buffers are only reserved here; batched prefill allocates them for
+    // its duration and frees them afterwards. Decode with that VRAM allocated (even
+    // untouched) was unstable on the dev box: 9 of 17 runs slow vs 0 of 11 with it free.
+    prefill_stage_reserved_ = use_stage;
 
     // 2a. CPU-offload mode: keep the remaining layers in host RAM and compute them on the CPU.
     if (cpu_offload_ && num_streamed > 0) {
@@ -598,6 +615,9 @@ Transformer::~Transformer() {
         if (ptr) CUDA_CHECK(cudaFree(ptr));
     }
     d_gpu_resident_layers_.clear();
+    for (auto* p : d_prefill_stage_) {
+        if (p) CUDA_CHECK(cudaFree(p));
+    }
 
     for (auto* ptr : h_offload_pinned_cache_) {
         if (ptr) CUDA_CHECK(cudaFreeHost(ptr));

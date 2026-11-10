@@ -196,6 +196,15 @@ private:
     size_t layer_buffer_size_ = 0;
     std::vector<LayerInfo>& layers_info_ = layout_.layers;
 
+    // Prefill staging (CPU-offload split only): two layer-sized GPU buffers that
+    // batched prefill streams the CPU layers' weights through. The planner keeps
+    // room for them; they are allocated only while a prefill runs, so decode keeps
+    // that VRAM free (decode was unstable with VRAM full on the RTX 3060 dev box).
+    // FRIDAY_PREFILL_STAGE=0 disables the reservation.
+    static constexpr int kPrefillStageCount = 2;
+    bool prefill_stage_reserved_ = false;
+    unsigned char* d_prefill_stage_[kPrefillStageCount] = {nullptr, nullptr};
+
     // Ping-Pong Asenkron Akışları
     cudaStream_t stream_compute_ = nullptr; // Stream 1: GPU Hesaplama
     cudaStream_t stream_io_ = nullptr;      // Stream 2: NVMe/PCIe Prefetch
