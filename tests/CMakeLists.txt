@@ -32,6 +32,9 @@ if(FRIDAY_ENABLE_CUDA)
     friday_test_target(test_decode_attention kernels/test_decode_attention.cu)
     add_test(NAME decode_attention COMMAND test_decode_attention)
     set_tests_properties(decode_attention PROPERTIES LABELS "gpu")
+    friday_test_target(test_prefill_gemm kernels/test_prefill_gemm.cu)
+    add_test(NAME prefill_gemm COMMAND test_prefill_gemm)
+    set_tests_properties(prefill_gemm PROPERTIES LABELS "gpu")
 endif()
 
 find_package(Python3 COMPONENTS Interpreter)
@@ -95,6 +98,12 @@ if(FRIDAY_MODEL_DIR AND (FRIDAY_ENABLE_CUDA OR FRIDAY_BIG_CPU_TESTS))
                  COMMAND golden_check ${_gguf} -
                          ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen25-32b-q2k - 12.0)
         set_tests_properties(model_regression_qwen25_32b_q2k_gguf PROPERTIES LABELS "model" TIMEOUT 600)
+        if(FRIDAY_ENABLE_CUDA)  # same golden with the prompt through Engine::prefill (batched)
+            add_test(NAME model_regression_qwen25_32b_q2k_prefill
+                     COMMAND golden_check ${_gguf} - ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen25-32b-q2k - 12.0)
+            set_tests_properties(model_regression_qwen25_32b_q2k_prefill PROPERTIES LABELS "model" TIMEOUT 600
+                                 ENVIRONMENT "FRIDAY_GOLDEN_PREFILL=1")
+        endif()
     endif()
     # Deprecated converter output (.bin + tensor_map.json + tokenizer_config.json), if present.
     if(EXISTS ${FRIDAY_MODEL_DIR}/friday_aligned_int4.bin AND EXISTS ${FRIDAY_MODEL_DIR}/tensor_map.json
@@ -125,6 +134,12 @@ if(FRIDAY_QWEN3_GGUF AND EXISTS ${FRIDAY_QWEN3_GGUF})
              COMMAND golden_check ${FRIDAY_QWEN3_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen3-8b-q4km - 3.0)
     set_tests_properties(model_regression_qwen3_8b_q4km model_regression_qwen3_8b_q4km_cpu
                          PROPERTIES LABELS "model" TIMEOUT 600)
+    if(FRIDAY_ENABLE_CUDA)
+        add_test(NAME model_regression_qwen3_8b_q4km_prefill
+                 COMMAND golden_check ${FRIDAY_QWEN3_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/qwen3-8b-q4km - 12.0)
+        set_tests_properties(model_regression_qwen3_8b_q4km_prefill PROPERTIES LABELS "model" TIMEOUT 600
+                             ENVIRONMENT "FRIDAY_GOLDEN_PREFILL=1")
+    endif()
 endif()
 set(FRIDAY_LLAMA31_GGUF "" CACHE FILEPATH
     "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (bartowski) for the Llama 3.1 model tests")
@@ -142,4 +157,12 @@ if(FRIDAY_LLAMA31_GGUF AND EXISTS ${FRIDAY_LLAMA31_GGUF})
              COMMAND golden_check ${FRIDAY_LLAMA31_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/llama31-8b-q4km - 3.0)
     set_tests_properties(model_regression_llama31_8b_q4km model_regression_llama31_8b_q4km_cpu
                          PROPERTIES LABELS "model" TIMEOUT 600)
+    if(FRIDAY_ENABLE_CUDA)  # prompt through Engine::prefill: all-GPU and GPU + CPU split
+        add_test(NAME model_regression_llama31_8b_q4km_prefill
+                 COMMAND golden_check ${FRIDAY_LLAMA31_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/llama31-8b-q4km - 12.0)
+        add_test(NAME model_regression_llama31_8b_q4km_prefill_split
+                 COMMAND golden_check ${FRIDAY_LLAMA31_GGUF} - ${CMAKE_CURRENT_SOURCE_DIR}/model/llama31-8b-q4km - 3.0)
+        set_tests_properties(model_regression_llama31_8b_q4km_prefill model_regression_llama31_8b_q4km_prefill_split
+                             PROPERTIES LABELS "model" TIMEOUT 600 ENVIRONMENT "FRIDAY_GOLDEN_PREFILL=1")
+    endif()
 endif()

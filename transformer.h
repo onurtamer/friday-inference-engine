@@ -106,6 +106,15 @@ public:
         cudaStream_t stream = nullptr
     );
 
+    // Batched prefill: runs tokens[0..n) at positions pos0 .. pos0 + n - 1 through
+    // every layer (GPU layers several tokens per weight read, see prefill_kernels.h),
+    // fills the KV caches, leaves the last token's hidden state in d_x_last and
+    // writes its logits to d_output_logits. Same results as n forward() calls up to
+    // fp32 summation order. Callers check prefillSupported() first.
+    bool prefillSupported() const;
+    void prefill(const int* tokens, int n, int pos0, half* d_x_last, half* d_output_logits, int vocab_size,
+                 cudaStream_t stream);
+
     // Token ID'den embedding vektörünü alır
     bool getEmbedding(int token_id, half* d_embedding, int vocab_size, cudaStream_t stream);
 
@@ -203,6 +212,20 @@ private:
     // FRIDAY_PREFILL_STAGE=0 disables the reservation.
     static constexpr int kPrefillStageCount = 2;
     bool prefill_stage_reserved_ = false;
+
+    // Prefill scratch for a chunk of up to `cap` tokens; allocated per prefill() call.
+    struct PrefillScratch {
+        int cap = 0;
+        half *x = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ctx = nullptr, *gate = nullptr, *up = nullptr;
+        int8_t* xq = nullptr;
+        float* xd = nullptr;
+        int* positions = nullptr;   // device, [cap]: pos0 + t
+        int* h_positions = nullptr; // pinned
+    };
+    bool allocPrefillScratch(PrefillScratch& ps, int cap);
+    void freePrefillScratch(PrefillScratch& ps);
+    void prefillLayerFused(int layer_idx, unsigned char* buf, PrefillScratch& ps, int T, cudaStream_t s);
+    void finalHead(half* d_x, half* d_output_logits, cudaStream_t s);
     unsigned char* d_prefill_stage_[kPrefillStageCount] = {nullptr, nullptr};
 
     // Ping-Pong Asenkron Akışları

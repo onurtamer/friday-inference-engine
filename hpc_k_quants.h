@@ -56,6 +56,12 @@ void rmsNormQuantQ8(const half* x, const float* w, int K, float eps, cudaStream_
 // SiLU(gate) * up with fp16 rounding at the same points as geluKernel + elementWiseMulKernel, quantized.
 void siluMulQuantQ8(const half* gate, const half* up, int K, cudaStream_t s);
 bool gemvQ8Supported(Q8Kind k);
+// Batched versions for [rows][K] inputs, writing caller-owned xq [rows][K] and
+// xd [rows][K / 32]; row r is quantized exactly as the single-vector call would.
+void quantizeQ8Rows(const half* x, int rows, int K, int8_t* xq, float* xd, cudaStream_t s);
+void rmsNormQuantQ8Rows(const half* x, const float* w, int rows, int K, float eps, int8_t* xq, float* xd,
+                        cudaStream_t s);
+void siluMulQuantQ8Rows(const half* gate, const half* up, int rows, int K, int8_t* xq, float* xd, cudaStream_t s);
 // y = W x (x from the scratch). Optional: W2 -> y2 (same shape and type, one launch),
 // bias (y += bias, fp32), res (y = res + y, fp16; y may alias res).
 void gemvQ8(Q8Kind kind, const void* W, half* y, int K, int N, cudaStream_t s, const void* W2 = nullptr,

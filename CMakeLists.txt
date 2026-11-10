@@ -43,6 +43,7 @@ set(FRIDAY_CUDA_SOURCES
     kernel_dispatcher.cpp
     hpc_k_quants.cu
     attention_kernels.cu
+    prefill_kernels.cu
 )
 # Host code shared by both builds; engine/tokenizer/IO see CUDA headers only
 # in the CUDA build (engine.cpp selects the backend).

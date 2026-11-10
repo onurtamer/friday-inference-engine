@@ -386,6 +386,8 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // One warp per 32-element block.
 __global__ void quantize_x_q8_kernel(const half* __restrict__ x, int8_t* __restrict__ xq,
                                      float* __restrict__ xd, int K) {
+    // Row blockIdx.y of a [rows][K] batch (gridDim.y = 1 for a single vector).
+    x += (size_t)blockIdx.y * K; xq += (size_t)blockIdx.y * K; xd += (size_t)blockIdx.y * (K / 32);
     const int lane = threadIdx.x & 31;
     const int blk = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (blk * 32 >= K) return;
@@ -689,6 +691,8 @@ void q8_0_q8_gemv_kernel(const uint8_t* __restrict__ W, const int8_t* __restrict
 __global__ void rmsnorm_quant_q8_kernel(const half* __restrict__ x, const float* __restrict__ w,
                                         int8_t* __restrict__ xq, float* __restrict__ xd, int K, float eps) {
     extern __shared__ float sm[];
+    // Row blockIdx.y of a [rows][K] batch (gridDim.y = 1 for a single vector).
+    x += (size_t)blockIdx.y * K; xq += (size_t)blockIdx.y * K; xd += (size_t)blockIdx.y * (K / 32);
     float* red = sm;
     half* xn = reinterpret_cast<half*>(sm + blockDim.x);
     const int tid = threadIdx.x, bs = blockDim.x;
@@ -732,6 +736,9 @@ __global__ void rmsnorm_quant_q8_kernel(const half* __restrict__ x, const float*
 // One warp per 32-value block: SiLU(gate) * up, both stored as fp16 in between, then quantized.
 __global__ void silu_mul_quant_q8_kernel(const half* __restrict__ gate, const half* __restrict__ up,
                                          int8_t* __restrict__ xq, float* __restrict__ xd, int K) {
+    // Row blockIdx.y of a [rows][K] batch (gridDim.y = 1 for a single vector).
+    gate += (size_t)blockIdx.y * K; up += (size_t)blockIdx.y * K;
+    xq += (size_t)blockIdx.y * K; xd += (size_t)blockIdx.y * (K / 32);
     const int lane = threadIdx.x & 31;
     const int blk = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (blk * 32 >= K) return;
@@ -886,6 +893,25 @@ void siluMulQuantQ8(const half* gate, const half* up, int K, cudaStream_t s) {
 }
 
 bool gemvQ8Supported(Q8Kind k) { return k != Q8Kind::None; }
+
+// Batched producers: the same kernels, one grid row per vector.
+void quantizeQ8Rows(const half* x, int rows, int K, int8_t* xq, float* xd, cudaStream_t s) {
+    const int warps = 8;
+    quantize_x_q8_kernel<<<dim3((K / 32 + warps - 1) / warps, rows), warps * WARP_SIZE, 0, s>>>(x, xq, xd, K);
+}
+
+void rmsNormQuantQ8Rows(const half* x, const float* w, int rows, int K, float eps, int8_t* xq, float* xd,
+                        cudaStream_t s) {
+    const int threads = 256;
+    const size_t smem = threads * sizeof(float) + (size_t)K * sizeof(half);
+    rmsnorm_quant_q8_kernel<<<dim3(1, rows), threads, smem, s>>>(x, w, xq, xd, K, eps);
+}
+
+void siluMulQuantQ8Rows(const half* gate, const half* up, int rows, int K, int8_t* xq, float* xd, cudaStream_t s) {
+    const int warps = 8;
+    silu_mul_quant_q8_kernel<<<dim3((K / 32 + warps - 1) / warps, rows), warps * WARP_SIZE, 0, s>>>(gate, up, xq,
+                                                                                                    xd, K);
+}
 
 void gemvQ8(Q8Kind kind, const void* W, half* y, int K, int N, cudaStream_t s, const void* W2, half* y2,
             const float* bias, const half* res) {

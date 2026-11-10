@@ -1,6 +1,7 @@
 // friday-bench: controlled decode/prefill benchmark through the public Engine API.
 //
-// Each run starts a new sequence: prefill P prompt tokens (one step per token),
+// Each run starts a new sequence: prefill P prompt tokens (Engine::prefill:
+// batched on the GPU when supported, otherwise one step per token),
 // then decode G tokens greedily. Recorded per run: prefill and decode tok/s,
 // per-token decode latency, the system's CPU load in a 1 s window before the run
 // (background load) and during it, free RAM, and GPU clocks / temperature /
@@ -208,7 +209,7 @@ int main(int argc, char** argv) {
             sampler.start();
             const friday::CpuTimes c0 = friday::cpuTimes();
             const auto t0 = Clock::now();
-            for (int i = 0; i < prompt_len; ++i) engine.step(prompt[i], i, logits.data());
+            engine.prefill(prompt.data(), prompt_len, 0, logits.data());
             const auto t1 = Clock::now();
             std::vector<int> out;
             std::vector<double> lat;
@@ -265,7 +266,8 @@ int main(int argc, char** argv) {
                     dec_med, *std::min_element(dec_tps.begin(), dec_tps.end()),
                     *std::max_element(dec_tps.begin(), dec_tps.end()), runs, percentile(all_lat_ms, 50),
                     percentile(all_lat_ms, 95));
-        std::printf("prefill : median %.2f tok/s (%d tokens, one step per token)\n", pre_med, prompt_len);
+        std::printf("prefill : median %.2f tok/s (%d tokens, %s)\n", pre_med, prompt_len,
+                    engine.batchedPrefill() ? "batched" : "one step per token");
         std::printf("output  : %s across runs\n", deterministic ? "identical" : "NOT identical");
 
         if (!json_path.empty()) {
@@ -299,6 +301,7 @@ int main(int argc, char** argv) {
                             {"decode_ms_p50", percentile(all_lat_ms, 50)},
                             {"decode_ms_p95", percentile(all_lat_ms, 95)},
                             {"prefill_tok_s_median", pre_med},
+                            {"prefill_mode", engine.batchedPrefill() ? "batched" : "step"},
                             {"output_identical_across_runs", deterministic}};
             std::ofstream f(json_path);
             f << j.dump(2) << "\n";

@@ -49,8 +49,11 @@ were identical across runs.
   the copy of the logits to host memory and their conversion to fp32.
   Sampling (greedy argmax) is outside the timed region.
 - llama.cpp: `timings.predicted_per_second` reported by llama-server.
-- Prefill is not comparable yet: FRIDAY processes the prompt one token at a time
-  (batched prefill is roadmap R4b), llama.cpp in batches.
+- Prefill: `Engine::prefill` (int8 tensor-core GEMM, compute capability 8.0+;
+  otherwise one step per token). The tables below up to 2026-11-10 were measured
+  one token at a time. First batched version (2026-11-10, Llama 3.1 8B, 512
+  tokens, 3 runs): 465 tok/s vs 51 before; llama.cpp 1944. Attention still runs
+  once per token and CPU layers of a split model still run token by token.
 
 ## Measured results
 

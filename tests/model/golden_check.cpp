@@ -175,7 +175,17 @@ int main(int argc, char** argv) {
             printf("[GOLDEN] smoke run finished after %d steps (no comparison)\n", max_steps);
             return 0;
         }
-        for (size_t i = 0; i < prompt_len; ++i) step(tokens[i], (int)i);
+        // FRIDAY_GOLDEN_PREFILL=1: the prompt goes through Engine::prefill (batched
+        // on the GPU when supported) instead of one step() per token.
+        const char* pf_env = std::getenv("FRIDAY_GOLDEN_PREFILL");
+        if (pf_env && pf_env[0] == '1') {
+            printf("[GOLDEN] prompt via Engine::prefill (%s)\n", engine.batchedPrefill() ? "batched" : "step loop");
+            const auto a = std::chrono::steady_clock::now();
+            engine.prefill(tokens.data(), (int)prompt_len, 0, logits.data());
+            engine_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+        } else {
+            for (size_t i = 0; i < prompt_len; ++i) step(tokens[i], (int)i);
+        }
         auto t1 = std::chrono::steady_clock::now();
         engine_prefill_s = engine_s;
 

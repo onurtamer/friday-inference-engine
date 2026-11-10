@@ -1,6 +1,7 @@
 #include "transformer.h"
 #include "attention_kernels.h"
 #include "hpc_k_quants.h"
+#include "prefill_kernels.h"
 #include "cpu_kquants.h"
 #include "gguf_file.h"
 #include "model_config.h"
@@ -1072,6 +1073,213 @@ void Transformer::gpuLayerFused(int layer_idx, unsigned char* buf, half* d_x, in
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Final norm + LM head of one hidden state (end of forward() and prefill()).
+void Transformer::finalHead(half* d_x, half* d_output_logits, cudaStream_t s) {
+    // Final RMSNorm (Post-transformer norm, weights are F32)
+    if (d_output_norm_) {
+        applyRMSNorm(
+            d_x,
+            (const float*)d_output_norm_,
+            d_x,
+            hidden_dim_,
+            s
+        );
+#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
+        checkBufferNaNs(d_x, hidden_dim_, "post-final-norm activations", s);
+#endif
+    }
+
+    // LM Head (Output Projeksiyonu)
+    if (d_lm_head_) {
+        std::string lm_head_weight_name = "output.weight";
+        if (!full_tensor_map_.count(lm_head_weight_name)) lm_head_weight_name = "lm_head.weight";
+        const TensorInfo& lm_head_info = full_tensor_map_.at(lm_head_weight_name);
+
+        FridayKernelDispatcher::dispatchGemvKernel(
+            getQuantTypeFromDtype(lm_head_info.dtype),
+            d_x,
+            d_lm_head_,
+            nullptr,
+            nullptr,
+            d_output_logits,
+            (int)lm_head_info.shape[0],
+            (int)lm_head_info.shape[1],
+            s
+        );
+        CUDA_CHECK(cudaGetLastError());
+#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
+        checkBufferNaNs(d_output_logits, (int)lm_head_info.shape[1], "LM Head output logits", s);
+#endif
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched prefill
+// ---------------------------------------------------------------------------
+bool Transformer::prefillSupported() const {
+    if (!fused_ok_) return false;
+    if (!cpu_offload_ && num_gpu_resident_layers_ < num_layers_) return false;  // PCIe stream mode
+    for (const auto& [name, t] : full_tensor_map_) {
+        if (name.rfind("blk.", 0) != 0 || name.find(".weight") == std::string::npos || t.shape.size() < 2) continue;
+        if (!friday_prefill::gemmQ8Supported(friday_hpc::q8KindFromDtype(t.dtype), (int)t.shape[0])) return false;
+    }
+    return true;
+}
+
+bool Transformer::allocPrefillScratch(PrefillScratch& ps, int cap) {
+    const size_t H = hidden_dim_, QD = (size_t)num_heads_ * head_dim_, KV = (size_t)num_kv_heads_ * head_dim_;
+    const size_t I = max_intermediate_size_, XQ = std::max(std::max(H, QD), I);
+    ps.cap = cap;
+    bool ok = cudaMalloc((void**)&ps.x, cap * H * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.q, cap * QD * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.k, cap * KV * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.v, cap * KV * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.ctx, cap * QD * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.gate, cap * I * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.up, cap * I * sizeof(half)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.xq, cap * XQ) == cudaSuccess &&
+              cudaMalloc((void**)&ps.xd, cap * (XQ / 32) * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void**)&ps.positions, cap * sizeof(int)) == cudaSuccess &&
+              cudaMallocHost((void**)&ps.h_positions, cap * sizeof(int)) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();  // clear the allocation error
+        freePrefillScratch(ps);
+    }
+    return ok;
+}
+
+void Transformer::freePrefillScratch(PrefillScratch& ps) {
+    for (void* p : {(void*)ps.x, (void*)ps.q, (void*)ps.k, (void*)ps.v, (void*)ps.ctx, (void*)ps.gate, (void*)ps.up,
+                    (void*)ps.xq, (void*)ps.xd, (void*)ps.positions})
+        if (p) cudaFree(p);
+    if (ps.h_positions) cudaFreeHost(ps.h_positions);
+    ps = PrefillScratch();
+}
+
+// gpuLayerFused for T tokens at positions *d_pos_ .. *d_pos_ + T - 1 (rows of ps).
+// Attention runs once per token with the decode kernel, so each query sees
+// exactly the keys it would see in decode.
+void Transformer::prefillLayerFused(int layer_idx, unsigned char* buf, PrefillScratch& ps, int T, cudaStream_t s) {
+    const auto& li = layers_info_[layer_idx];
+    const std::string pre = "blk." + std::to_string(layer_idx) + ".";
+    auto ptr = [&](const char* n) -> unsigned char* {
+        auto it = li.tensor_rel_offsets.find(pre + n);
+        return it == li.tensor_rel_offsets.end() ? nullptr : buf + it->second;
+    };
+    auto info = [&](const char* n) -> const TensorInfo& { return full_tensor_map_.at(pre + n); };
+    auto gemm = [&](const char* n, int K, half* y, int ldy, const float* bias, const half* res) {
+        const TensorInfo& t = info(n);
+        friday_prefill::gemmQ8(friday_hpc::q8KindFromDtype(t.dtype), ptr(n), ps.xq, ps.xd, T, K, (int)t.shape[1], y,
+                               ldy, s, bias, res);
+    };
+    const int H = hidden_dim_, kv_dim = num_kv_heads_ * head_dim_, QD = num_heads_ * head_dim_;
+
+    friday_hpc::rmsNormQuantQ8Rows(ps.x, (const float*)ptr("attn_norm.weight"), T, H, rms_norm_epsilon_, ps.xq, ps.xd,
+                                   s);
+    gemm("attn_q.weight", H, ps.q, QD, (const float*)ptr("attn_q.bias"), nullptr);
+    gemm("attn_k.weight", H, ps.k, kv_dim, (const float*)ptr("attn_k.bias"), nullptr);
+    gemm("attn_v.weight", H, ps.v, kv_dim, (const float*)ptr("attn_v.bias"), nullptr);
+    if (ptr("attn_q_norm.weight") && ptr("attn_k_norm.weight")) {
+        headRmsNormKernel<<<num_heads_ * T, head_dim_, head_dim_ * sizeof(float), s>>>(
+            ps.q, (const float*)ptr("attn_q_norm.weight"), head_dim_, rms_norm_epsilon_);
+        headRmsNormKernel<<<num_kv_heads_ * T, head_dim_, head_dim_ * sizeof(float), s>>>(
+            ps.k, (const float*)ptr("attn_k_norm.weight"), head_dim_, rms_norm_epsilon_);
+    }
+    const size_t layer_elems = (size_t)layer_idx * max_ctx_ * kv_dim;
+    const dim3 rope_grid((head_dim_ / 2 + 255) / 256, T);
+    if (kv_q8_) {
+        int8_t* kq = reinterpret_cast<int8_t*>(d_k_cache_) + layer_elems;
+        int8_t* vq = reinterpret_cast<int8_t*>(d_v_cache_) + layer_elems;
+        half* ks = d_k_scale_ + layer_elems / 32;
+        half* vs = d_v_scale_ + layer_elems / 32;
+        ropeStoreKvKernel<<<rope_grid, 256, 0, s>>>(ps.q, ps.k, ps.v, nullptr, nullptr, d_pos_, head_dim_, num_heads_,
+                                                    num_kv_heads_, rope_freq_base_, rope_neox_ ? 1 : 0, d_rope_freqs_);
+        const int warps = 8, nblk = 2 * kv_dim / 32;
+        storeKvQ8Kernel<<<dim3((nblk + warps - 1) / warps, T), warps * 32, 0, s>>>(ps.k, ps.v, kq, ks, vq, vs, d_pos_,
+                                                                                  kv_dim);
+        for (int t = 0; t < T; ++t)
+            friday_attn::launchDecodeAttentionSplit(ps.q + (size_t)t * QD, kq, vq, ps.ctx + (size_t)t * QD, 0,
+                                                    ps.positions + t, max_ctx_, num_heads_, num_kv_heads_, head_dim_,
+                                                    d_attn_ws_, s, ks, vs);
+    } else {
+        half* k_layer = d_k_cache_ + layer_elems;
+        half* v_layer = d_v_cache_ + layer_elems;
+        ropeStoreKvKernel<<<rope_grid, 256, 0, s>>>(ps.q, ps.k, ps.v, k_layer, v_layer, d_pos_, head_dim_, num_heads_,
+                                                    num_kv_heads_, rope_freq_base_, rope_neox_ ? 1 : 0, d_rope_freqs_);
+        for (int t = 0; t < T; ++t) {
+            if (attn_split_)
+                friday_attn::launchDecodeAttentionSplit(ps.q + (size_t)t * QD, k_layer, v_layer, ps.ctx + (size_t)t * QD,
+                                                        0, ps.positions + t, max_ctx_, num_heads_, num_kv_heads_,
+                                                        head_dim_, d_attn_ws_, s);
+            else
+                friday_attn::launchDecodeAttentionDevPos(ps.q + (size_t)t * QD, k_layer, v_layer,
+                                                         ps.ctx + (size_t)t * QD, ps.positions + t, max_ctx_,
+                                                         num_heads_, num_kv_heads_, head_dim_, s);
+        }
+    }
+    friday_hpc::quantizeQ8Rows(ps.ctx, T, QD, ps.xq, ps.xd, s);
+    gemm("attn_output.weight", QD, ps.x, H, nullptr, ps.x);
+
+    friday_hpc::rmsNormQuantQ8Rows(ps.x, (const float*)ptr("ffn_norm.weight"), T, H, rms_norm_epsilon_, ps.xq, ps.xd,
+                                   s);
+    const int I = (int)info("ffn_gate.weight").shape[1];
+    gemm("ffn_gate.weight", H, ps.gate, I, nullptr, nullptr);
+    gemm("ffn_up.weight", H, ps.up, I, nullptr, nullptr);
+    friday_hpc::siluMulQuantQ8Rows(ps.gate, ps.up, T, I, ps.xq, ps.xd, s);
+    gemm("ffn_down.weight", I, ps.x, H, nullptr, ps.x);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void Transformer::prefill(const int* tokens, int n, int pos0, half* d_x_last, half* d_output_logits, int vocab_size,
+                          cudaStream_t s) {
+    if (n <= 0) return;
+    if (pos0 < 0 || pos0 + n > max_ctx_)
+        throw std::runtime_error("context length exceeded: prefill of " + std::to_string(n) + " tokens at position " +
+                                 std::to_string(pos0) + ", max context " + std::to_string(max_ctx_));
+    const int H = hidden_dim_;
+    PrefillScratch ps;
+    int cap = std::min(n, 512);
+    while (!allocPrefillScratch(ps, cap)) {
+        if (cap <= 16) throw std::runtime_error("prefill: not enough GPU memory for the batch buffers");
+        cap /= 2;
+    }
+    for (int c0 = 0; c0 < n; c0 += cap) {
+        const int T = std::min(cap, n - c0), p0 = pos0 + c0;
+        CUDA_CHECK(cudaStreamSynchronize(s));  // pinned h_pos_ / h_positions are free again
+        for (int t = 0; t < T; ++t) {
+            if (!getEmbedding(tokens[c0 + t], ps.x + (size_t)t * H, vocab_size, s))
+                throw std::runtime_error("embedding failed for token " + std::to_string(tokens[c0 + t]));
+            ps.h_positions[t] = p0 + t;
+        }
+        *h_pos_ = p0;
+        CUDA_CHECK(cudaMemcpyAsync(d_pos_, h_pos_, sizeof(int), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(ps.positions, ps.h_positions, T * sizeof(int), cudaMemcpyHostToDevice, s));
+        for (int l = 0; l < num_gpu_resident_layers_; ++l) prefillLayerFused(l, d_gpu_resident_layers_[l], ps, T, s);
+        // CPU layers: token by token, as in decode.
+        if (cpu_offload_ && num_gpu_resident_layers_ < num_layers_) {
+            for (int t = 0; t < T; ++t) {
+                half* row = ps.x + (size_t)t * H;
+                CUDA_CHECK(cudaMemcpyAsync(h_act_pinned_, row, H * sizeof(half), cudaMemcpyDeviceToHost, s));
+                CUDA_CHECK(cudaStreamSynchronize(s));
+                float* x = cpu_runner_->hidden();
+                const uint16_t* hb = reinterpret_cast<const uint16_t*>(h_act_pinned_);
+                for (int i = 0; i < H; ++i) x[i] = friday_cpu::halfToFloat(hb[i]);
+                cpu_runner_->run(p0 + t);
+                uint16_t* ho = reinterpret_cast<uint16_t*>(h_act_pinned_);
+                for (int i = 0; i < H; ++i) ho[i] = friday_cpu::floatToHalf(x[i]);
+                CUDA_CHECK(cudaMemcpyAsync(row, h_act_pinned_, H * sizeof(half), cudaMemcpyHostToDevice, s));
+                CUDA_CHECK(cudaStreamSynchronize(s));
+            }
+        }
+        if (c0 + T == n)
+            CUDA_CHECK(cudaMemcpyAsync(d_x_last, ps.x + (size_t)(T - 1) * H, H * sizeof(half),
+                                       cudaMemcpyDeviceToDevice, s));
+    }
+    finalHead(d_x_last, d_output_logits, s);
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    freePrefillScratch(ps);
+}
+
 // Ana Forward Pass: V27 Ping-Pong Double Buffering mimarisi
 void Transformer::forward(
     half* d_input_activations,
@@ -1316,42 +1524,7 @@ void Transformer::forward(
             CUDA_CHECK(cudaEventRecord(ev_slot_free_[curr_slot], compute_stream));
         }
     }
-    // Final RMSNorm (Post-transformer norm, weights are F32)
-    if (d_output_norm_) {
-        applyRMSNorm(
-            d_input_activations,
-            (const float*)d_output_norm_,
-            d_input_activations,
-            hidden_dim_,
-            compute_stream
-        );
-#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
-        checkBufferNaNs(d_input_activations, hidden_dim_, "post-final-norm activations", compute_stream);
-#endif
-    }
-
-    // LM Head (Output Projeksiyonu)
-    if (d_lm_head_) {
-        std::string lm_head_weight_name = "output.weight";
-        if (!full_tensor_map_.count(lm_head_weight_name)) lm_head_weight_name = "lm_head.weight";
-        const TensorInfo& lm_head_info = full_tensor_map_.at(lm_head_weight_name);
-
-        FridayKernelDispatcher::dispatchGemvKernel(
-            getQuantTypeFromDtype(lm_head_info.dtype),
-            d_input_activations,
-            d_lm_head_,
-            nullptr,
-            nullptr,
-            d_output_logits,
-            (int)lm_head_info.shape[0],
-            (int)lm_head_info.shape[1],
-            compute_stream
-        );
-        CUDA_CHECK(cudaGetLastError());
-#ifdef FRIDAY_DEBUG_NANS  // diagnostic: syncs the stream and copies the buffer to host
-        checkBufferNaNs(d_output_logits, (int)lm_head_info.shape[1], "LM Head output logits", compute_stream);
-#endif
-    }
+    finalHead(d_input_activations, d_output_logits, compute_stream);
 
     CUDA_CHECK(cudaStreamSynchronize(compute_stream));
     if (profile_) {

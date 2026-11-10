@@ -366,7 +366,12 @@ __global__ void ropeStoreKvKernel(half* d_query, half* d_key, const half* d_valu
     int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_head_dim = head_dim / 2;
     if (pair_idx >= half_head_dim) return;
-    const int pos_offset = *d_pos;
+    // Batched (prefill): token blockIdx.y at position *d_pos + blockIdx.y, rows of
+    // [T][heads * head_dim]; gridDim.y = 1 for a single token.
+    d_query += (size_t)blockIdx.y * num_q_heads * head_dim;
+    d_key += (size_t)blockIdx.y * num_kv_heads * head_dim;
+    d_value += (size_t)blockIdx.y * num_kv_heads * head_dim;
+    const int pos_offset = *d_pos + (int)blockIdx.y;
     half* k_dst = k_layer + (size_t)pos_offset * num_kv_heads * head_dim;
     half* v_dst = v_layer + (size_t)pos_offset * num_kv_heads * head_dim;
     float position = (float)pos_offset;
@@ -409,7 +414,10 @@ __global__ void storeKvQ8Kernel(const half* k, const half* v, int8_t* k_layer,
     if (blk >= 2 * nblk) return;
     const bool is_v = blk >= nblk;
     const int b = is_v ? blk - nblk : blk;
-    const size_t pos = (size_t)*d_pos;
+    // Batched (prefill): token blockIdx.y at position *d_pos + blockIdx.y.
+    k += (size_t)blockIdx.y * kv_dim;
+    v += (size_t)blockIdx.y * kv_dim;
+    const size_t pos = (size_t)*d_pos + blockIdx.y;
     const float x = __half2float((is_v ? v : k)[b * 32 + lane]);
     float amax = fabsf(isnan(x) ? 0.0f : x);
     for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));

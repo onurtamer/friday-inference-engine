@@ -244,4 +244,33 @@ void Engine::step(int token, int pos, float* logits) {
     m.cpu->logits(m.cpu->hidden(), logits);
 }
 
+bool Engine::batchedPrefill() const {
+#if FRIDAY_HAVE_CUDA
+    const char* e = std::getenv("FRIDAY_PREFILL");
+    if (e && e[0] == '0') return false;
+    return impl_->kind == BackendKind::Cuda && impl_->gpu->prefillSupported();
+#else
+    return false;
+#endif
+}
+
+void Engine::prefill(const int* tokens, int n, int pos, float* logits) {
+    if (n <= 0) return;
+#if FRIDAY_HAVE_CUDA
+    Impl& m = *impl_;
+    if (batchedPrefill()) {
+        half* act = static_cast<half*>(m.d_act);
+        half* lg = static_cast<half*>(m.d_logits);
+        cudaMemsetAsync(lg, 0, (size_t)m.vocab * 2, m.stream);
+        m.gpu->prefill(tokens, n, pos, act, lg, m.vocab, m.stream);
+        if (cudaMemcpyAsync(m.h_logits.data(), lg, (size_t)m.vocab * 2, cudaMemcpyDeviceToHost, m.stream) != cudaSuccess ||
+            cudaStreamSynchronize(m.stream) != cudaSuccess)
+            throw std::runtime_error("CUDA error copying logits");
+        for (int i = 0; i < m.vocab; ++i) logits[i] = friday_cpu::halfToFloat(m.h_logits[i]);
+        return;
+    }
+#endif
+    for (int i = 0; i < n; ++i) step(tokens[i], pos + i, logits);
+}
+
 }  // namespace friday

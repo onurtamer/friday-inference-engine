@@ -47,6 +47,13 @@ public:
     // at 0 for a new sequence) and writes vocabSize() logits to `logits`.
     void step(int token, int pos, float* logits);
 
+    // Runs tokens[0..n) at positions pos .. pos + n - 1 (e.g. a prompt) and writes
+    // the logits of the last one. Batched on the GPU when supported (int8 tensor
+    // cores, compute capability 8.0+; FRIDAY_PREFILL=0 disables it), otherwise n
+    // step() calls. Results match step() up to fp32 summation order.
+    void prefill(const int* tokens, int n, int pos, float* logits);
+    bool batchedPrefill() const;   // true if prefill() runs batched
+
     // True if this build includes the CUDA backend.
     static bool cudaCompiledIn();
 
